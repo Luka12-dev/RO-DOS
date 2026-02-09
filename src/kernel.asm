@@ -52,9 +52,9 @@ kernel_entry:
     call puts
     add esp, 4
 
-    ; init mem
+    ; init mem - Increased heap size to 16MB for better memory availability
     mov eax, 0x00200000
-    mov ebx, 0x00200000
+    mov ebx, 0x01000000     ; 16MB heap instead of 2MB
     call mem_init
 
     push dword mem_init_msg
@@ -65,11 +65,11 @@ kernel_entry:
     call puts
     add esp, 4
 
-    ; Unmask timer and keyboard (enable IRQ0 and IRQ1)
-    mov al, 0xFC
+    ; Unmask timer, keyboard, and cascade to slave (enable IRQ0, IRQ1, IRQ2)
+    mov al, 0xF8        ; 11111000 - IRQ0, IRQ1, IRQ2 enabled
     out 0x21, al
-    ; keep slave masked
-    mov al, 0xFF
+    ; Unmask IRQ12 on slave PIC for PS/2 mouse
+    mov al, 0xEF        ; 11101111 - IRQ12 enabled (bit 4 = IRQ12)
     out 0xA1, al
 
     sti
@@ -104,7 +104,7 @@ sys_reboot:
     jmp $
 
 section .rodata
-kernel_ok_msg       db "RO-DOS Kernel v1.0", 13, 10, 0
+kernel_ok_msg       db "RO-DOS Kernel v1.2 Beta", 13, 10, 0
 system_ready_msg    db "System initialized", 13, 10, 0
 mem_init_msg        db "Memory manager ready", 13, 10, 0
 enabling_int_msg    db "Enabling interrupts...", 13, 10, 0
