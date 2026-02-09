@@ -52,27 +52,29 @@ code_start:
     mov dword [kernel_lba], KERNEL_LBA
     mov word  [kernel_sectors], KERNEL_SECTORS
     mov dword [kernel_dest], KERNEL_DEST
-    call read_sectors_lba
-
+    call read_sectors
+    
+    ; Clear VESA info - kernel will detect no VESA and use VGA fallback
+    ; GUI apps will set VESA mode when launched
+    mov dword [0x9000], 0
+    mov dword [0x9004], 0
+    mov dword [0x9008], 0
+    
     ; Enable A20
     in al, 0x92
     or al, 2
     out 0x92, al
 
-    ; Load GDT
     lgdt [gdtr]
 
-    ; Enter protected mode
     mov eax, cr0
     or  eax, 1
     mov cr0, eax
 
-    ; Far jump to 32-bit code segment
     jmp 0x08:pmode_entry
 
 BITS 32
 pmode_entry:
-    ; Setup 32-bit flat segments
     mov ax, 0x10
     mov ds, ax
     mov es, ax
@@ -81,112 +83,73 @@ pmode_entry:
     mov ss, ax
     mov esp, 0x90000
 
-    ; Jump to kernel entry point
     jmp 0x08:KERNEL_DEST
 
-; Read kernel from disk (LBA)
-
+; Read kernel using CHS (works on all BIOS)
 BITS 16
-read_sectors_lba:
+read_sectors:
     pusha
-    push ds
     push es
-    xor ax, ax
-    mov ds, ax
 
-.load_loop:
+.loop:
     cmp word [kernel_sectors], 0
     je .done
 
-    ; Compute ES:BX from linear kernel_dest
-    mov ax, word [kernel_dest]
-    mov dx, word [kernel_dest+2]
-    mov cx, ax
-    shr cx, 4
-    mov bx, dx
-    shl bx, 12
-    or  bx, cx
-    mov es, bx
-    mov bx, ax
+    ; ES:BX = destination
+    mov ax, word [kernel_dest+2]
+    mov bx, word [kernel_dest]
+    shr bx, 4
+    shl ax, 12
+    or ax, bx
+    mov es, ax
+    mov bx, word [kernel_dest]
     and bx, 0x0F
 
-    ; Compute CHS from kernel_lba
+    ; LBA to CHS
     mov ax, [kernel_lba]
     xor dx, dx
-    mov cx, SECTORS_PER_TRACK*HEADS_PER_CYL
-    div cx
-    mov bp, ax
-    mov ax, dx
-    mov cx, SECTORS_PER_TRACK
-    xor dx, dx
-    div cx
-    mov dh, al
+    div word [sec_per_trk]
     mov cl, dl
     inc cl
-    mov ax, bp
+    xor dx, dx
+    div word [num_heads]
     mov ch, al
-    shr ax, 8
-    and al, 0x03
-    shl al, 6
-    or cl, al
-
-    mov al, 1
-    mov ah, 0x02
+    mov dh, dl
     mov dl, [drive_num]
 
-    mov di, 3
-.read_retry:
-    push ax
-    push bx
-    push cx
-    push dx
+    mov ax, 0x0201
     int 0x13
-    pop dx
-    pop cx
-    pop bx
-    pop ax
-    jnc .read_ok
+    jc .retry
 
-    mov ah, 0
+    inc word [kernel_lba]
+    dec word [kernel_sectors]
+    add word [kernel_dest], 512
+    adc word [kernel_dest+2], 0
+    jmp .loop
+
+.retry:
+    xor ax, ax
     int 0x13
-    dec di
-    jnz .read_retry
-    jmp .disk_error
-
-.read_ok:
-    inc dword [kernel_lba]
-    dec word  [kernel_sectors]
-    add word  [kernel_dest], 512
-    adc word  [kernel_dest+2], 0
-    jmp .load_loop
-
-.disk_error:
-    cli
-.hang:
-    hlt
-    jmp .hang
+    jmp .loop
 
 .done:
     pop es
-    pop ds
     popa
     ret
 
-; GDT - Flat 32-bit
-
-ALIGN 8
+; GDT
+ALIGN 4
 gdt_start:
-    dq 0x0000000000000000        ; Null
-    dq 0x00CF9A000000FFFF        ; Code segment, 0x08
-    dq 0x00CF92000000FFFF        ; Data segment, 0x10
+    dq 0
+    dq 0x00CF9A000000FFFF
+    dq 0x00CF92000000FFFF
 gdt_end:
 
 gdtr:
     dw gdt_end - gdt_start - 1
     dd gdt_start
 
-; Variables
-kernel_lba      dd 0
+kernel_lba      dw 0
 kernel_sectors  dw 0
 kernel_dest     dd 0
 
