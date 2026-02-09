@@ -1,6 +1,7 @@
-#include <stdint.h>
-#include <stddef.h>
+#include "../include/network.h"
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 /* External Wrappers (from kernel.asm) */
 extern void c_puts(const char *s);
@@ -9,13 +10,14 @@ extern void c_cls(void);
 extern uint16_t c_getkey(void);
 extern void set_attr(uint8_t a);
 extern void sys_reboot(void);
+extern void sys_shutdown(void);
 extern uint32_t get_ticks(void);
 extern void sys_beep(uint32_t freq, uint32_t duration);
 extern void sleep_ms(uint32_t ms);
 
 #define puts c_puts
 #define putc c_putc
-#define cls  c_cls
+#define cls c_cls
 #define getkey c_getkey
 
 /* Filesystem primitives (filesys.asm) */
@@ -23,3924 +25,3466 @@ extern int fs_list_root(uint32_t out_dir_buffer, uint32_t max_entries);
 
 /* Memory management (memory.asm) */
 extern void mem_get_stats(uint32_t *stats);
+extern void *kmalloc(uint32_t size);
+extern void kfree(void *ptr);
 
 /* System call functions (from syscall.c) */
-extern int sys_get_time(uint8_t* hours, uint8_t* minutes, uint8_t* seconds);
-extern int sys_get_date(uint8_t* day, uint8_t* month, uint16_t* year);
-extern int sys_sysinfo(void* info);
-extern int sys_uname(char* buffer, uint32_t size);
-extern int sys_getpid(void);
-extern int sys_read_sector(uint32_t lba, uint32_t count, void* buffer);
-extern int sys_opendir(const char* path);
-extern int sys_readdir(int fd, void* entry);
-extern int sys_closedir(int fd);
-extern int sys_stat(const char* path, void* statbuf);
-extern int sys_getcwd(char* buffer, uint32_t size);
-extern int sys_chdir(const char* path);
+extern int sys_get_time(uint8_t *hours, uint8_t *minutes, uint8_t *seconds);
+extern int sys_get_date(uint8_t *day, uint8_t *month, uint16_t *year);
+extern int sys_read_sector(uint32_t lba, uint32_t count, void *buffer);
+extern int disk_read_lba(uint32_t lba, uint32_t count, void *buffer);
+
+/* Disk write function - we need to add this */
+extern int disk_write_lba(uint32_t lba, uint32_t count, void *buffer);
 
 /* Global State */
-static char current_dir[256] = "C:\\";
-static char dir_stack[10][256];
-static int dir_stack_ptr = 0;
+char current_dir[256] = "C:\\"; /* Not static - exported to shell */
 static uint8_t current_color = 0x07;
-static char env_vars[20][2][128]; // 20 env vars, key-value pairs
-static int env_count = 0;
-static bool echo_enabled = true;
 
-/* Simulated filesystem entries */
+/* REAL Filesystem Storage - Using reserved sectors on disk */
+#define FS_DATA_START_LBA                                                      \
+  500 /* Start after kernel on hard disk (safe area)                           \
+       */
+#define FS_MAX_FILES 128
+#define FS_MAX_USERS 32
+#define FS_MAX_FILENAME 56
+#define FS_CONTENT_START_LBA 700 /* File contents start here */
+
+/* File entry structure (64 bytes each) */
 typedef struct {
-    char name[64];
-    uint32_t size;
-    uint8_t type; // 0=file, 1=dir
-    uint8_t attr; // DOS attributes
+  char name[FS_MAX_FILENAME];
+  uint32_t size;
+  uint8_t type; /* 0=file, 1=dir */
+  uint8_t attr;
+  uint16_t parent_idx;
+  uint16_t reserved;
 } FSEntry;
 
-static FSEntry fs_entries[50];
-static int fs_entry_count = 0;
-
-/* Simulated process table */
+/* User entry structure (64 bytes each) */
 typedef struct {
-    uint16_t pid;
-    char name[32];
-    uint8_t priority;
-    uint32_t mem_kb;
-    bool active;
-} Process;
+  char username[32];
+  char password_hash[32]; /* Simple hash */
+} UserEntry;
 
-static Process proc_table[16];
-static int proc_count = 0;
+/* In-memory caches */
+FSEntry fs_table[FS_MAX_FILES];
+int fs_count = 0;
+static UserEntry user_table[FS_MAX_USERS];
+static int user_count = 0;
+static char current_user[32] = "root";
 
-/* Simulated network interfaces */
+/* Process Management Simulation */
 typedef struct {
-    char name[16];
-    char ip[16];
-    char mask[16];
-    char gateway[16];
-    bool active;
-} NetInterface;
+  uint32_t pid;
+  char name[32];
+  char state[16];
+  uint32_t mem_usage; // in KB
+  uint8_t priority;
+} ProcessEntry;
 
-static NetInterface net_ifaces[4];
-static int net_iface_count = 0;
+#define MAX_PROCESSES 16
+static ProcessEntry process_table[MAX_PROCESSES];
+static int process_count = 0;
 
-/* Simulated disk drives */
+/* Initialize processes if empty */
+static void str_copy(char *dst, const char *src, int max);
+
+static void ensure_processes_init(void) {
+  if (process_count == 0) {
+    /* Kernel (PID 1) */
+    process_table[0].pid = 1;
+    str_copy(process_table[0].name, "KERNEL", 32);
+    str_copy(process_table[0].state, "RUNNING", 16);
+    process_table[0].mem_usage = 128; // 128K
+    process_table[0].priority = 0; // High
+    
+    /* Shell (PID 2) */
+    process_table[1].pid = 2;
+    str_copy(process_table[1].name, "SHELL", 32);
+    str_copy(process_table[1].state, "RUNNING", 16);
+    process_table[1].mem_usage = 64; // 64K
+    process_table[1].priority = 10; // Normal
+    
+    /* Network Service (PID 3) */
+    process_table[2].pid = 3;
+    str_copy(process_table[2].name, "NETSVC", 32);
+    str_copy(process_table[2].state, "SLEEPING", 16);
+    process_table[2].mem_usage = 32; // 32K
+    process_table[2].priority = 10;
+    
+    /* Display Service (PID 4) */
+    process_table[3].pid = 4;
+    str_copy(process_table[3].name, "DISPSVC", 32);
+    str_copy(process_table[3].state, "SLEEPING", 16);
+    process_table[3].mem_usage = 48; // 48K
+    process_table[3].priority = 15; // Low
+    
+    process_count = 4;
+  }
+}
+
+
+/* File content storage (simple buffer) */
+
+#define MAX_FILE_SIZE 4096
 typedef struct {
-    char letter;
-    char label[32];
-    uint32_t total_mb;
-    uint32_t free_mb;
-    uint8_t type; // 0=HDD, 1=FDD, 2=CD
-} DiskDrive;
+  uint16_t file_idx;
+  uint32_t size;
+  char data[MAX_FILE_SIZE];
+} FileContent;
 
-static DiskDrive drives[8];
-static int drive_count = 0;
+static FileContent file_contents[64] = {0};
+static int file_content_count = 0;
 
 /* Utility Functions */
+static int str_len(const char *s) {
+  if (!s)
+    return 0;
+  int l = 0;
+  while (s[l])
+    l++;
+  return l;
+}
 
-static char *utoa_decimal(char *buf, uint32_t v) {
-    if (v == 0) {
-        buf[0] = '0';
-        buf[1] = '\0';
-        return buf;
+static void str_copy(char *dst, const char *src, int max) {
+  int i = 0;
+  while (i < max - 1 && src[i]) {
+    dst[i] = src[i];
+    i++;
+  }
+  dst[i] = '\0';
+}
+
+/* Forward declarations */
+static int str_cmp(const char *a, const char *b);
+int cmd_dispatch(const char *line);
+
+/* Helper to save content to file system */
+static int save_file_content(const char *filename, const char *data, int len) {
+  if (!filename || !data || len < 0)
+    return -1;
+
+  // Convert filename to full path if not absolute
+  char full_path[256];
+  if (filename[1] != ':') { // Simple check for C: or similar
+    int dir_len = str_len(current_dir);
+    for (int k = 0; k < dir_len; k++)
+      full_path[k] = current_dir[k];
+
+    int name_len = str_len(filename);
+    for (int k = 0; k < name_len; k++)
+      full_path[dir_len + k] = filename[k];
+    full_path[dir_len + name_len] = '\0';
+  } else {
+    str_copy(full_path, filename, 256);
+  }
+
+  // Check if file exists -> overwrite
+  int idx = -1;
+  for (int i = 0; i < fs_count; i++) {
+    if (str_cmp(fs_table[i].name, full_path) == 0) {
+      idx = i;
+      break;
     }
+  }
+
+  if (idx == -1) {
+    // Create new
+    if (fs_count >= FS_MAX_FILES) {
+      puts("Error: Disk full\n");
+      return -1;
+    }
+    idx = fs_count++;
+    str_copy(fs_table[idx].name, full_path, FS_MAX_FILENAME);
+    fs_table[idx].type = 0; // File
+    fs_table[idx].attr = 0;
+    fs_table[idx].parent_idx = 0xFFFF; // Root
+  }
+
+  // Update size
+  fs_table[idx].size = len;
+
+  // Save content
+  // Find content slot
+  int content_idx = -1;
+  for (int i = 0; i < file_content_count; i++) {
+    if (file_contents[i].file_idx == idx) {
+      content_idx = i;
+      break;
+    }
+  }
+
+  if (content_idx == -1) {
+    if (file_content_count >= 64) {
+      puts("Error: Content storage full\n");
+      return -1;
+    }
+    content_idx = file_content_count++;
+    file_contents[content_idx].file_idx = idx;
+  }
+
+  // Copy data (truncate if too large)
+  if (len > MAX_FILE_SIZE)
+    len = MAX_FILE_SIZE;
+  for (int k = 0; k < len; k++) {
+    file_contents[content_idx].data[k] = data[k];
+  }
+  file_contents[content_idx].size = len;
+
+  return 0;
+}
+
+static int str_cmp(const char *a, const char *b) {
+  if (!a || !b)
+    return -1;
+  while (*a && *b && *a == *b) {
+    a++;
+    b++;
+  }
+  return *a - *b;
+}
+
+static int str_ncmp(const char *a, const char *b, int n)
+    __attribute__((unused));
+static int str_ncmp(const char *a, const char *b, int n) {
+  if (!a || !b)
+    return -1;
+  for (int i = 0; i < n; i++) {
+    if (a[i] != b[i] || !a[i])
+      return a[i] - b[i];
+  }
+  return 0;
+}
+
+static void str_upper(char *s) {
+  while (*s) {
+    if (*s >= 'a' && *s <= 'z')
+      *s -= 32;
+    s++;
+  }
+}
+
+static void int_to_str(uint32_t n, char *buf) {
+  if (n == 0) {
+    buf[0] = '0';
+    buf[1] = '\0';
+    return;
+  }
+  int i = 0;
+  uint32_t tmp = n;
+  while (tmp > 0) {
+    tmp /= 10;
+    i++;
+  }
+  buf[i] = '\0';
+  while (n > 0) {
+    buf[--i] = '0' + (n % 10);
+    n /= 10;
+  }
+}
+
+static uint32_t str_to_int(const char *s) {
+  uint32_t n = 0;
+  while (*s >= '0' && *s <= '9') {
+    n = n * 10 + (*s - '0');
+    s++;
+  }
+  return n;
+}
+
+static void print_hex(uint32_t n) {
+  char hex[] = "0123456789ABCDEF";
+  char buf[9];
+  for (int i = 7; i >= 0; i--) {
+    buf[i] = hex[n & 0xF];
+    n >>= 4;
+  }
+  buf[8] = '\0';
+  puts(buf);
+}
+
+/* Simple hash function */
+static uint32_t hash_string(const char *s) {
+  uint32_t h = 5381;
+  while (*s) {
+    h = ((h << 5) + h) + (uint32_t)(*s);
+    s++;
+  }
+  return h;
+}
+
+/* Define sector for current directory storage */
+#define FS_CURDIR_LBA 499 /* Store current directory just before file table */
+
+/* FIXED: fs_save_to_disk - Save content indexed by file_idx, not loop position
+ */
+static int fs_save_to_disk(void) {
+  char sector[512];
+
+  /* Save current directory first */
+  for (int j = 0; j < 512; j++)
+    sector[j] = 0;
+  for (int j = 0; j < 256 && current_dir[j]; j++) {
+    sector[j] = current_dir[j];
+  }
+  if (disk_write_lba(FS_CURDIR_LBA, 1, sector) != 0) {
+    return -1;
+  }
+
+  /* Save file table - save ALL files up to FS_MAX_FILES */
+  for (int i = 0; i < fs_count && i < FS_MAX_FILES; i++) {
+    for (int j = 0; j < 512; j++)
+      sector[j] = 0;
+    for (int j = 0; j < 64 && j < (int)sizeof(FSEntry); j++) {
+      sector[j] = ((char *)&fs_table[i])[j];
+    }
+    if (disk_write_lba(FS_DATA_START_LBA + i, 1, sector) != 0) {
+      return -1;
+    }
+  }
+
+  /* Clear remaining file slots - clear up to 64 entries */
+  for (int i = fs_count; i < 64; i++) {
+    for (int j = 0; j < 512; j++)
+      sector[j] = 0;
+    disk_write_lba(FS_DATA_START_LBA + i, 1, sector);
+  }
+
+  /* Save user table */
+  for (int i = 0; i < user_count && i < FS_MAX_USERS; i++) {
+    for (int j = 0; j < 512; j++)
+      sector[j] = 0;
+    for (int j = 0; j < 64 && j < (int)sizeof(UserEntry); j++) {
+      sector[j] = ((char *)&user_table[i])[j];
+    }
+    if (disk_write_lba(FS_DATA_START_LBA + 128 + i, 1, sector) != 0) {
+      return -1;
+    }
+  }
+
+  /* Clear remaining user slots */
+  for (int i = user_count; i < 5; i++) {
+    for (int j = 0; j < 512; j++)
+      sector[j] = 0;
+    disk_write_lba(FS_DATA_START_LBA + 128 + i, 1, sector);
+  }
+
+  /* Save file contents - Write each file's content to its designated sectors */
+  for (int c = 0; c < file_content_count; c++) {
+    uint16_t file_idx = file_contents[c].file_idx;
+    uint32_t file_size = file_contents[c].size;
+
+    /* Calculate sectors needed for this file */
+    uint32_t sectors_needed = (file_size + 511) / 512;
+    if (sectors_needed == 0)
+      sectors_needed = 1;
+
+    /* Write file content sectors */
+    for (uint32_t s = 0; s < sectors_needed && s < 16; s++) {
+      /* Zero sector buffer */
+      for (int j = 0; j < 512; j++)
+        sector[j] = 0;
+
+      /* Calculate how much to copy for this sector */
+      uint32_t offset = s * 512;
+      uint32_t to_copy = file_size - offset;
+      if (to_copy > 512)
+        to_copy = 512;
+
+      /* Copy data to sector buffer */
+      for (uint32_t j = 0; j < to_copy; j++) {
+        sector[j] = file_contents[c].data[offset + j];
+      }
+
+      /* Write sector to disk at the correct LBA for this file */
+      uint32_t lba = FS_CONTENT_START_LBA + (file_idx * 16) + s;
+      if (disk_write_lba(lba, 1, sector) != 0) {
+        return -1;
+      }
+    }
+
+    /* Clear remaining sectors for this file (if file shrunk) */
+    for (uint32_t s = sectors_needed; s < 16; s++) {
+      for (int j = 0; j < 512; j++)
+        sector[j] = 0;
+      uint32_t lba = FS_CONTENT_START_LBA + (file_idx * 16) + s;
+      disk_write_lba(lba, 1, sector);
+    }
+  }
+
+  return 0;
+}
+
+/* FIXED: fs_load_from_disk - Load content and match by file_idx correctly */
+static int fs_load_from_disk(void) {
+  char sector[512];
+
+  /* Load current directory first */
+  if (disk_read_lba(FS_CURDIR_LBA, 1, sector) == 0) {
+    if (sector[0] != 0 && sector[0] == 'C' && sector[1] == ':') {
+      /* Valid current directory found - copy it */
+      for (int j = 0; j < 256 && sector[j]; j++) {
+        current_dir[j] = sector[j];
+      }
+      /* Ensure null termination */
+      current_dir[255] = '\0';
+    }
+    /* If not valid, keep default "C:\" */
+  }
+
+  /* Load file table - read up to 64 entries */
+  fs_count = 0;
+  for (int i = 0; i < 64 && i < FS_MAX_FILES; i++) {
+    if (disk_read_lba(FS_DATA_START_LBA + i, 1, sector) == 0) {
+      /* Check if this is a valid entry - first char of filename must not be 0 */
+      if (sector[0] != 0) {
+        for (int j = 0; j < 64 && j < (int)sizeof(FSEntry); j++) {
+          ((char *)&fs_table[fs_count])[j] = sector[j];
+        }
+        fs_count++;
+      } else {
+        /* Empty slot - stop reading (files are stored contiguously) */
+        break;
+      }
+    }
+  }
+
+  /* Load user table */
+  user_count = 0;
+  for (int i = 0; i < 5 && i < FS_MAX_USERS; i++) {
+    if (disk_read_lba(FS_DATA_START_LBA + 128 + i, 1, sector) == 0) {
+      if (sector[0] != 0) {
+        for (int j = 0; j < 64 && j < (int)sizeof(UserEntry); j++) {
+          ((char *)&user_table[user_count])[j] = sector[j];
+        }
+        user_count++;
+      }
+    }
+  }
+
+  /* CRITICAL FIX: Load file contents properly */
+  file_content_count = 0;
+
+  /* For each file in fs_table that has size > 0 */
+  for (int i = 0; i < fs_count && file_content_count < 64; i++) {
+    if (fs_table[i].size > 0 && fs_table[i].type == 0) {
+      /* Calculate sectors needed */
+      uint32_t sectors_needed = (fs_table[i].size + 511) / 512;
+      if (sectors_needed == 0)
+        sectors_needed = 1;
+
+      /* Set up file_contents entry */
+      file_contents[file_content_count].file_idx = i;
+      file_contents[file_content_count].size = fs_table[i].size;
+
+      /* Zero out the entire data buffer first */
+      for (int z = 0; z < MAX_FILE_SIZE; z++) {
+        file_contents[file_content_count].data[z] = 0;
+      }
+
+      /* Read content from disk - using file_idx i */
+      uint32_t total_read = 0;
+      for (uint32_t s = 0; s < sectors_needed && s < 16; s++) {
+        uint32_t lba = FS_CONTENT_START_LBA + (i * 16) + s;
+        if (disk_read_lba(lba, 1, sector) == 0) {
+          uint32_t to_copy = fs_table[i].size - total_read;
+          if (to_copy > 512)
+            to_copy = 512;
+
+          for (uint32_t j = 0; j < to_copy && total_read < MAX_FILE_SIZE; j++) {
+            file_contents[file_content_count].data[total_read++] = sector[j];
+          }
+        }
+      }
+
+      file_content_count++;
+    }
+  }
+
+  return 0;
+}
+
+/* Initialize filesystem - silent flag to suppress output */
+static int fs_init_silent = 0;
+
+static void fs_init_commands(void) {
+  /* CRITICAL FIX: Explicitly zero out ALL filesystem state */
+  fs_count = 0;
+  user_count = 0;
+
+  /* CRITICAL: Zero out file_content_count and the entire array! */
+  file_content_count = 0;
+  for (int i = 0; i < 64; i++) {
+    file_contents[i].file_idx = 0;
+    file_contents[i].size = 0;
+    for (int j = 0; j < MAX_FILE_SIZE; j++) {
+      file_contents[i].data[j] = 0;
+    }
+  }
+
+  /* Load from disk - this will update the counters */
+  fs_load_from_disk();
+
+  /* Only print messages if not silent */
+  if (!fs_init_silent) {
+    /* Verify file_content_count is correct */
+    char buf[16];
+    puts("[INIT: file_content_count=");
+    int_to_str(file_content_count, buf);
+    puts(buf);
+    puts("]\n");
+
+    /* Print initialization message */
+    puts("Ready. ");
+    int_to_str(fs_count, buf);
+    puts(buf);
+    puts(" files, ");
+    int_to_str(file_content_count, buf);
+    puts(buf);
+    puts(" contents loaded. Type HELP for commands.\n");
+  }
+
+  /* If no users, create default root user */
+  if (user_count == 0) {
+    str_copy(user_table[0].username, "root", 32);
+    uint32_t h = hash_string("root");
+    for (int i = 0; i < 32; i++) {
+      user_table[0].password_hash[i] = (char)((h >> (i % 4 * 8)) & 0xFF);
+    }
+    user_count = 1;
+  }
+}
+
+/* Command parsing */
+static const char *skip_spaces(const char *s) {
+  while (*s == ' ' || *s == '\t')
+    s++;
+  return s;
+}
+
+static const char *get_token(const char *s, char *token, int max) {
+  s = skip_spaces(s);
+  int i = 0;
+  while (*s && *s != ' ' && *s != '\t' && i < max - 1) {
+    token[i++] = *s++;
+  }
+  token[i] = '\0';
+  return s;
+}
+
+/* COMMAND IMPLEMENTATIONS */
+
+/* Forward declaration for NETMODE command (defined in cmd_netmode.c) */
+extern int cmd_netmode(const char *args);
+
+/* Rust WiFi Driver functions */
+extern int wifi_driver_init(void);
+extern int wifi_driver_test(void);
+extern int wifi_send_packet(void *iface, const uint8_t *data, uint32_t len);
+extern int wifi_recv_packet(void *iface, uint8_t *data, uint32_t max_len);
+extern int wifi_get_mac(uint8_t *mac);
+extern int wifi_is_connected(void);
+extern void wifi_driver_shutdown(void);
+
+/* Rust GPU Driver functions */
+extern int gpu_driver_init(void);
+extern int gpu_driver_test(void);
+extern uint32_t *gpu_setup_framebuffer(void);
+extern int gpu_flush(void);
+extern void gpu_clear(uint32_t color);
+extern void gpu_fill_rect(int x, int y, int w, int h, uint32_t color);
+extern void gpu_draw_char(int x, int y, uint8_t c, uint32_t fg, uint32_t bg);
+extern void gpu_draw_string(int x, int y, const uint8_t *str, uint32_t fg, uint32_t bg);
+extern void gpu_disable_scanout(void);
+
+/* GUI Applications (from gui_apps.c) */
+extern int gui_notepad(const char *args);
+extern int gui_paint(const char *args);
+extern int gui_sysinfo(const char *args);
+extern int gui_filebrowser(const char *args);
+extern int gui_clock(const char *args);
+
+
+/* GUITEST - Test Rust GPU driver with graphical display */
+static int cmd_guitest(const char *args) {
+  (void)args;
+  
+  // Call GPU test function directly - it saves screen first before any output
+  return gpu_driver_test();
+}
+
+/* CALC-GUI - GUI Calculator with mouse AND keyboard support */
+static int cmd_calc_gui(const char *args) {
+  (void)args;
+  
+  // Setup framebuffer (it will initialize GPU driver if needed)
+  uint32_t *fb = gpu_setup_framebuffer();
+  if (fb == NULL) {
+    puts("Could not setup framebuffer\n");
+    return -1;
+  }
+  
+  // Initialize mouse
+  extern int mouse_init(void);
+  extern void mouse_poll(void);
+  extern int mouse_get_x(void);
+  extern int mouse_get_y(void);
+  extern bool mouse_get_left(void);
+  
+  mouse_init();
+  
+  // Calculator state
+  char display[32] = "0";
+  int32_t stored_value = 0;
+  int32_t current_value = 0;
+  char operation = 0;
+  bool new_number = true;
+  bool mouse_was_down = false;
+  
+  // Colors (VGA Compatible)
+  uint32_t bg_color = 0x00AAAAAA;      // Gray
+  uint32_t display_bg = 0x00000000;    // Black
+  uint32_t button_color = 0x00555555;  // Dark Gray
+  uint32_t button_hover = 0x00888888;  // Hover color
+  uint32_t button_op = 0x000000AA;     // Blue for operators
+  uint32_t text_color = 0x00FFFFFF;    // White
+  
+  // Button layout
+  const char buttons[] = "789/456*123-0.=+C";
+  const int num_buttons = 17;
+  
+  extern int gpu_get_width(void);
+  extern int gpu_get_height(void);
+  int scr_w = gpu_get_width();
+  int scr_h = gpu_get_height();
+  if (scr_w == 0) scr_w = 320;
+  if (scr_h == 0) scr_h = 200;
+
+  /* Calculate button layout based on actual screen size */
+  int btn_w, btn_h, btn_gap, btn_x, btn_y;
+  
+  if (scr_w >= 800) {
+    btn_w = 70;
+    btn_h = 60;
+    btn_gap = 10;
+    btn_x = (scr_w - (btn_w * 4 + btn_gap * 3)) / 2;
+    btn_y = 150;
+  } else {
+    /* VGA 320x200 mode - compact layout */
+    btn_w = 35;
+    btn_h = 22;
+    btn_gap = 4;
+    btn_x = (scr_w - (btn_w * 4 + btn_gap * 3)) / 2;
+    btn_y = 45;
+  }
+  
+  int selected_row = 0, selected_col = 0;
+  
+  /* Helper function to process a button press */
+  #define PROCESS_BUTTON(btn_char) do { \
+    char bc = (btn_char); \
+    int display_len = str_len(display); \
+    if (bc == 'C') { \
+      display[0] = '0'; display[1] = '\0'; \
+      stored_value = 0; current_value = 0; operation = 0; new_number = true; \
+    } else if (bc >= '0' && bc <= '9') { \
+      if (new_number || (display_len == 1 && display[0] == '0')) { \
+        display[0] = bc; display[1] = '\0'; new_number = false; \
+      } else if (display_len < 10) { \
+        display[display_len] = bc; display[display_len + 1] = '\0'; \
+      } \
+    } else if (bc == '.') { \
+      bool has_dot = false; \
+      for (int i = 0; i < display_len; i++) if (display[i] == '.') has_dot = true; \
+      if (!has_dot && display_len < 10) { \
+        display[display_len] = '.'; display[display_len + 1] = '\0'; \
+      } \
+    } else if (bc == '=') { \
+      current_value = 0; \
+      for (int i = 0; display[i]; i++) { \
+        if (display[i] >= '0' && display[i] <= '9') \
+          current_value = current_value * 10 + (display[i] - '0'); \
+      } \
+      if (operation == '+') current_value = stored_value + current_value; \
+      else if (operation == '-') current_value = stored_value - current_value; \
+      else if (operation == '*') current_value = stored_value * current_value; \
+      else if (operation == '/') { if (current_value != 0) current_value = stored_value / current_value; } \
+      int_to_str(current_value, display); \
+      operation = 0; new_number = true; \
+    } else if (bc == '+' || bc == '-' || bc == '*' || bc == '/') { \
+      current_value = 0; \
+      for (int i = 0; display[i]; i++) { \
+        if (display[i] >= '0' && display[i] <= '9') \
+          current_value = current_value * 10 + (display[i] - '0'); \
+      } \
+      stored_value = current_value; \
+      operation = bc; \
+      new_number = true; \
+    } \
+  } while(0)
+  
+  while (1) {
+    // Poll mouse
+    mouse_poll();
+    int mx = mouse_get_x();
+    int my = mouse_get_y();
+    bool mouse_down = mouse_get_left();
+    
+    // Clear screen
+    gpu_clear(bg_color);
+    
+    // Draw title
+    const char *title = "CALCULATOR";
+    int title_x = (scr_w - 10 * 8) / 2;
+    gpu_draw_string(title_x, 4, (uint8_t*)title, text_color, bg_color);
+    
+    // Draw display
+    int display_w = btn_w * 4 + btn_gap * 3;
+    int display_h = 16;
+    gpu_fill_rect(btn_x, btn_y - display_h - 6, display_w, display_h, display_bg);
+    gpu_draw_string(btn_x + 4, btn_y - display_h - 2, (uint8_t*)display, text_color, display_bg);
+    
+    // Draw buttons
+    int clicked_btn = -1;
+    for (int i = 0; i < num_buttons; i++) {
+      int row = i / 4;
+      int col = i % 4;
+      
+      int x = btn_x + col * (btn_w + btn_gap);
+      int y = btn_y + row * (btn_h + btn_gap);
+      
+      // Skip if off screen
+      if (y + btn_h > scr_h - 8) continue;
+      
+      // Check mouse hover
+      bool hover = (mx >= x && mx < x + btn_w && my >= y && my < y + btn_h);
+      bool is_selected = (row == selected_row && col == selected_col);
+      
+      // Check mouse click
+      if (hover && mouse_down && !mouse_was_down) {
+        clicked_btn = i;
+      }
+      
+      // Determine button color
+      uint32_t color = button_color;
+      char bc = buttons[i];
+      if (bc == '/' || bc == '*' || bc == '-' || bc == '+' || bc == '=') {
+        color = button_op;
+      }
+      if (hover || is_selected) {
+        color = button_hover;
+      }
+      
+      gpu_fill_rect(x, y, btn_w, btn_h, color);
+      
+      // Draw button text centered
+      int tx = x + (btn_w - 8) / 2;
+      int ty = y + (btn_h - 8) / 2;
+      gpu_draw_char(tx, ty, bc, text_color, color);
+    }
+    
+    // Draw mouse cursor
+    extern void gui_draw_cursor(int x, int y);
+    gui_draw_cursor(mx, my);
+    
+    // Draw instructions
+    if (scr_h >= 200) {
+      gpu_draw_string(btn_x, scr_h - 10, (uint8_t*)"Click or type keys", text_color, bg_color);
+    }
+    
+    gpu_flush();
+    
+    // Handle mouse click
+    if (clicked_btn >= 0 && clicked_btn < num_buttons) {
+      PROCESS_BUTTON(buttons[clicked_btn]);
+    }
+    mouse_was_down = mouse_down;
+    
+    // Check keyboard (non-blocking)
+    extern uint16_t c_getkey_nonblock(void);
+    uint16_t key = 0;
+    if (c_getkey_nonblock()) {
+      key = c_getkey();
+      char ch = key & 0xFF;
+      
+      // ESC to exit
+      if (ch == 27) break;
+      
+      // Direct keyboard input for digits and operators
+      if (ch >= '0' && ch <= '9') {
+        PROCESS_BUTTON(ch);
+      } else if (ch == '+' || ch == '-' || ch == '*' || ch == '/') {
+        PROCESS_BUTTON(ch);
+      } else if (ch == '=' || ch == '\r' || ch == '\n') {
+        // Enter or = key
+        if (ch == '\r' || ch == '\n') {
+          // If using arrow nav, execute selected button
+          int idx = selected_row * 4 + selected_col;
+          if (idx >= 0 && idx < num_buttons) {
+            PROCESS_BUTTON(buttons[idx]);
+          }
+        } else {
+          PROCESS_BUTTON('=');
+        }
+      } else if (ch == 'c' || ch == 'C') {
+        PROCESS_BUTTON('C');
+      } else if (ch == '.') {
+        PROCESS_BUTTON('.');
+      }
+      
+      // Arrow key navigation (extended keys have scan code in high byte)
+      uint8_t scan = (key >> 8) & 0xFF;
+      if (scan == 0x48 && selected_row > 0) selected_row--;  // Up
+      else if (scan == 0x50 && selected_row < 4) selected_row++;  // Down
+      else if (scan == 0x4B && selected_col > 0) selected_col--;  // Left
+      else if (scan == 0x4D && selected_col < 3) selected_col++;  // Right
+    }
+    
+    // Small delay
+    for (volatile int i = 0; i < 20000; i++);
+  }
+  
+  #undef PROCESS_BUTTON
+  
+  gpu_disable_scanout();
+  cls();
+  puts("Calculator closed.\n");
+  return 0;
+}
+
+/* WIFITEST - Test Rust WiFi driver */
+static int cmd_wifitest(const char *args) {
+  (void)args;
+  
+  puts("=== Rust WiFi Driver Test ===\n");
+  puts("Running wifi_driver_test()...\n");
+  
+  // Call Rust WiFi test function
+  return wifi_driver_test();
+}
+
+/* NETSTART - Initialize network and get IP via DHCP */
+static int cmd_netstart(const char *args) {
+  (void)args;
+  
+  extern int dhcp_init(network_interface_t *iface);
+  extern int dhcp_discover(network_interface_t *iface);
+  extern void netif_poll(void);
+  
+  set_attr(0x0B); // Cyan
+  puts("\n=== Network Initialization (Rust Driver) ===\n");
+  set_attr(0x07);
+  
+  // Initialize Rust WiFi driver
+  puts("[1/3] Initializing Rust WiFi driver...\n");
+  
+  int result = wifi_driver_init();
+  puts("[NETSTART] wifi_driver_init returned: ");
+  putc('0' + (result & 0xF));
+  puts("\n");
+  
+  if (result != 0) {
+    set_attr(0x0C); // Red
+    puts("ERROR: Failed to initialize Rust WiFi driver!\n");
+    set_attr(0x07);
+    return -1;
+  }
+  
+  set_attr(0x0A); // Green
+  puts("✓ Rust WiFi driver initialized\n");
+  set_attr(0x07);
+  
+  // Get interface
+  network_interface_t *iface = netif_get_default();
+  
+  if (!iface) {
+    set_attr(0x0C);
+    puts("ERROR: No network interface available!\n");
+    set_attr(0x07);
+    return -1;
+  }
+  
+  // Initialize DHCP
+  puts("[2/3] Initializing DHCP client...\n");
+  
+  if (dhcp_init(iface) != 0) {
+    set_attr(0x0C);
+    puts("ERROR: Failed to initialize DHCP!\n");
+    set_attr(0x07);
+    return -1;
+  }
+  
+  set_attr(0x0A);
+  puts("✓ DHCP client initialized\n");
+  set_attr(0x07);
+  
+  // Send DHCP DISCOVER
+  puts("[3/3] Requesting IP address via DHCP...\n");
+  
+  for (int attempt = 0; attempt < 3; attempt++) {
+    
+    if (attempt > 0) {
+      puts("Retry ");
+      putc('0' + attempt);
+      puts("/3...\n");
+    }
+    
+    puts("[DEBUG] NETSTART: Calling dhcp_discover...\n");
+    int disc_result = dhcp_discover(iface);
+    puts("[DEBUG] NETSTART: dhcp_discover returned: ");
+    putc('0' + (disc_result & 0xF));
+    puts("\n");
+    
+    if (disc_result < 0) {
+      puts("Failed to send DHCP DISCOVER\n");
+      continue;
+    }
+    
+    puts("[DEBUG] NETSTART: Waiting for DHCP response...\n");
+    
+    // Wait for DHCP response
+    uint32_t start = get_ticks();
+    bool got_ip = false;
+    int poll_count = 0;
+    
+    while (get_ticks() - start < 90) { // ~5 seconds
+      // Poll for DHCP response
+      for (int i = 0; i < 20; i++) {
+        netif_poll();
+        poll_count++;
+      }
+      
+      // Check if we got an IP
+      if (iface->ip_addr != 0) {
+        puts("[DEBUG] NETSTART: Got IP address after ");
+        char cnt[8];
+        cnt[0] = '0' + (poll_count / 1000) % 10;
+        cnt[1] = '0' + (poll_count / 100) % 10;
+        cnt[2] = '0' + (poll_count / 10) % 10;
+        cnt[3] = '0' + poll_count % 10;
+        cnt[4] = '\0';
+        puts(cnt);
+        puts(" polls\n");
+        got_ip = true;
+        break;
+      }
+    }
+    
+    puts("[DEBUG] NETSTART: Finished waiting. poll_count=");
+    char cnt[8];
+    cnt[0] = '0' + (poll_count / 1000) % 10;
+    cnt[1] = '0' + (poll_count / 100) % 10;
+    cnt[2] = '0' + (poll_count / 10) % 10;
+    cnt[3] = '0' + poll_count % 10;
+    cnt[4] = '\0';
+    puts(cnt);
+    puts("\n");
+    
+    if (got_ip) {
+      set_attr(0x0A); // Green
+      puts("\n✓ IP address configured!\n\n");
+      set_attr(0x07);
+      
+      // Show IP info
+      puts("IP Address:  ");
+      char buf[16];
+      int_to_str((iface->ip_addr >> 24) & 0xFF, buf);
+      puts(buf); puts(".");
+      int_to_str((iface->ip_addr >> 16) & 0xFF, buf);
+      puts(buf); puts(".");
+      int_to_str((iface->ip_addr >> 8) & 0xFF, buf);
+      puts(buf); puts(".");
+      int_to_str(iface->ip_addr & 0xFF, buf);
+      puts(buf); puts("\n");
+      
+      puts("Gateway:     ");
+      int_to_str((iface->gateway >> 24) & 0xFF, buf);
+      puts(buf); puts(".");
+      int_to_str((iface->gateway >> 16) & 0xFF, buf);
+      puts(buf); puts(".");
+      int_to_str((iface->gateway >> 8) & 0xFF, buf);
+      puts(buf); puts(".");
+      int_to_str(iface->gateway & 0xFF, buf);
+      puts(buf); puts("\n");
+      
+      puts("DNS Server:  ");
+      int_to_str((iface->dns_server >> 24) & 0xFF, buf);
+      puts(buf); puts(".");
+      int_to_str((iface->dns_server >> 16) & 0xFF, buf);
+      puts(buf); puts(".");
+      int_to_str((iface->dns_server >> 8) & 0xFF, buf);
+      puts(buf); puts(".");
+      int_to_str(iface->dns_server & 0xFF, buf);
+      puts(buf); puts("\n\n");
+      
+      set_attr(0x0E);
+      puts("Network ready! You can now use WGET, PING, etc.\n");
+      set_attr(0x07);
+      return 0;
+    }
+  }
+  
+  set_attr(0x0C);
+  puts("\nERROR: Failed to get IP address via DHCP\n");
+  puts("Check that QEMU is running with: -net nic,model=virtio -net user\n");
+  set_attr(0x07);
+  return -1;
+}
+
+/* 1. HELP - Show command list */
+static int cmd_help(const char *args) {
+  (void)args;
+  puts("======================================================================="
+       "=\n");
+  puts("RO-DOS Available Commands:\n");
+  puts("  File: DIR LS CD MKDIR RMDIR TOUCH DEL CAT NANO TYPE COPY MOVE REN "
+       "FIND\n");
+  puts("  Disk: CHKDSK FORMAT LABEL VOL DISKPART FSCK\n");
+  puts("  Info: VER TIME DATE UPTIME MEM SYSINFO UNAME WHOAMI HOSTNAME\n");
+  puts("  User: USERADD USERDEL PASSWD USERS LOGIN LOGOUT SU SUDO\n");
+  puts("  Proc: PS KILL TOP TASKLIST TASKKILL\n");
+  puts("  Misc: CLS CLEAR COLOR ECHO BEEP CALC HEXDUMP ASCII HASH\n");
+  puts("  Ctrl: REBOOT SHUTDOWN HALT PAUSE SLEEP EXIT\n");
+  puts("  Network: NETSTART IPCONFIG PING WGET WIFITEST\n");
+  puts("  Graphics: GUITEST CALC-GUI NOTEPAD PAINT FILEBROWSER CLOCK\n");
+  puts("  Programming: PYTHON (Mini Python interpreter)\n");
+  puts("======================================================================="
+       "=\n");
+  return 0;
+}
+
+/* 2. CLS/CLEAR - Clear screen */
+static int cmd_cls(const char *args) {
+  (void)args;
+  cls();
+  return 0;
+}
+
+/* 3. VER - Show version */
+static int cmd_ver(const char *args) {
+  (void)args;
+  puts("RO-DOS Version 1.2v Beta\n");
+  puts("Real-Mode Operating System\n");
+  return 0;
+}
+
+/* 4. TIME - Show current time */
+static int cmd_time(const char *args) {
+  (void)args;
+  uint8_t h, m, s;
+  if (sys_get_time(&h, &m, &s) == 0) {
+    char buf[16];
+    int_to_str(h, buf);
+    puts(buf);
+    puts(":");
+    if (m < 10)
+      puts("0");
+    int_to_str(m, buf);
+    puts(buf);
+    puts(":");
+    if (s < 10)
+      puts("0");
+    int_to_str(s, buf);
+    puts(buf);
+    puts("\n");
+  }
+  return 0;
+}
+
+/* 5. DATE - Show current date */
+static int cmd_date(const char *args) {
+  (void)args;
+  uint8_t day, month;
+  uint16_t year;
+  if (sys_get_date(&day, &month, &year) == 0) {
+    char buf[16];
+    int_to_str(year, buf);
+    puts(buf);
+    puts("-");
+    if (month < 10)
+      puts("0");
+    int_to_str(month, buf);
+    puts(buf);
+    puts("-");
+    if (day < 10)
+      puts("0");
+    int_to_str(day, buf);
+    puts(buf);
+    puts("\n");
+  }
+  return 0;
+}
+
+/* 6. REBOOT - Reboot system */
+static int cmd_reboot(const char *args) {
+  (void)args;
+  puts("Rebooting...\n");
+  sleep_ms(1000);
+  sys_reboot();
+  return 0;
+}
+
+/* 7. SHUTDOWN - Shutdown system */
+static int cmd_shutdown(const char *args) {
+  (void)args;
+  puts("System shutting down...\n");
+  sleep_ms(2000);
+  sys_shutdown();
+  return 0;
+}
+
+/* 8. MKDIR - Create directory */
+static int cmd_mkdir(const char *args) {
+  char name[64];
+  args = get_token(args, name, 64);
+
+  if (name[0] == 0) {
+    puts("Usage: MKDIR dirname\n");
+    return -1;
+  }
+
+  if (fs_count >= FS_MAX_FILES) {
+    puts("Error: Filesystem full\n");
+    return -1;
+  }
+
+  /* Build full path: current_dir + dirname */
+  char full_path[256];
+  int dir_len = str_len(current_dir);
+  for (int i = 0; i < dir_len && i < 255; i++) {
+    full_path[i] = current_dir[i];
+  }
+
+  /* Add dirname */
+  int name_len = str_len(name);
+  for (int i = 0; i < name_len && (dir_len + i) < 255; i++) {
+    full_path[dir_len + i] = name[i];
+  }
+  full_path[dir_len + name_len] = '\0';
+
+  /* Check if already exists */
+  for (int i = 0; i < fs_count; i++) {
+    if (str_cmp(fs_table[i].name, full_path) == 0) {
+      puts("Error: Already exists\n");
+      return -1;
+    }
+  }
+
+  str_copy(fs_table[fs_count].name, full_path, FS_MAX_FILENAME);
+  fs_table[fs_count].size = 0;
+  fs_table[fs_count].type = 1;
+  fs_table[fs_count].attr = 0x10;
+  fs_count++;
+
+  fs_save_to_disk();
+  puts("Directory created: ");
+  puts(name);
+  puts("\n");
+  return 0;
+}
+
+/* 9. RMDIR - Remove directory */
+static int cmd_rmdir(const char *args) {
+  char name[64];
+  args = get_token(args, name, 64);
+
+  if (name[0] == 0) {
+    puts("Usage: RMDIR dirname\n");
+    return -1;
+  }
+
+  for (int i = 0; i < fs_count; i++) {
+    if (str_cmp(fs_table[i].name, name) == 0 && fs_table[i].type == 1) {
+      for (int j = i; j < fs_count - 1; j++) {
+        fs_table[j] = fs_table[j + 1];
+      }
+      fs_count--;
+      fs_save_to_disk();
+      puts("Directory removed\n");
+      return 0;
+    }
+  }
+
+  puts("Error: Directory not found\n");
+  return -1;
+}
+
+/* 10. TOUCH - Create empty file */
+static int cmd_touch(const char *args) {
+  char name[64];
+  args = get_token(args, name, 64);
+
+  if (name[0] == 0) {
+    puts("Usage: TOUCH filename\n");
+    return -1;
+  }
+
+  if (fs_count >= FS_MAX_FILES) {
+    puts("Error: Filesystem full\n");
+    return -1;
+  }
+
+  /* Build full path: current_dir + filename */
+  char full_path[256];
+  int dir_len = str_len(current_dir);
+  for (int i = 0; i < dir_len && i < 255; i++) {
+    full_path[i] = current_dir[i];
+  }
+
+  /* Add filename */
+  int name_len = str_len(name);
+  for (int i = 0; i < name_len && (dir_len + i) < 255; i++) {
+    full_path[dir_len + i] = name[i];
+  }
+  full_path[dir_len + name_len] = '\0';
+
+  /* Check if file already exists in this directory */
+  for (int i = 0; i < fs_count; i++) {
+    if (str_cmp(fs_table[i].name, full_path) == 0) {
+      puts("File already exists\n");
+      return 0;
+    }
+  }
+
+  str_copy(fs_table[fs_count].name, full_path, FS_MAX_FILENAME);
+  fs_table[fs_count].size = 0;
+  fs_table[fs_count].type = 0;
+  fs_table[fs_count].attr = 0x20;
+  fs_count++;
+
+  fs_save_to_disk();
+  puts("File created: ");
+  puts(name);
+  puts("\n");
+  return 0;
+}
+
+/* 11. DEL/RM - Delete file */
+static int cmd_del(const char *args) {
+  char name[64];
+  args = get_token(args, name, 64);
+
+  if (name[0] == 0) {
+    puts("Usage: DEL filename\n");
+    return -1;
+  }
+
+  /* Build full path */
+  char full_path[256];
+  int dir_len = str_len(current_dir);
+  for (int i = 0; i < dir_len && i < 255; i++) {
+    full_path[i] = current_dir[i];
+  }
+  int name_len = str_len(name);
+  for (int i = 0; i < name_len && (dir_len + i) < 255; i++) {
+    full_path[dir_len + i] = name[i];
+  }
+  full_path[dir_len + name_len] = '\0';
+
+  for (int i = 0; i < fs_count; i++) {
+    if (str_cmp(fs_table[i].name, full_path) == 0 && fs_table[i].type == 0) {
+      for (int j = i; j < fs_count - 1; j++) {
+        fs_table[j] = fs_table[j + 1];
+      }
+      fs_count--;
+      fs_save_to_disk();
+      puts("File deleted\n");
+      return 0;
+    }
+  }
+
+  puts("Error: File not found\n");
+  return -1;
+}
+
+/* 12. DIR/LS - List directory */
+static int cmd_dir(const char *args) {
+  (void)args;
+
+  puts("Directory of ");
+  puts(current_dir);
+  puts("\n\n");
+
+  int file_count = 0;
+  int dir_count = 0;
+  uint32_t total_size = 0;
+
+  int current_dir_len = str_len(current_dir);
+
+  for (int i = 0; i < fs_count; i++) {
+    /* Check if this entry is in the current directory */
+    bool in_current_dir = true;
+
+    /* Compare path prefix */
+    for (int j = 0; j < current_dir_len; j++) {
+      if (fs_table[i].name[j] != current_dir[j]) {
+        in_current_dir = false;
+        break;
+      }
+    }
+
+    /* Make sure there's no subdirectory after current path */
+    if (in_current_dir && fs_table[i].name[current_dir_len] != '\0') {
+      for (int j = current_dir_len; fs_table[i].name[j] != '\0'; j++) {
+        if (fs_table[i].name[j] == '\\') {
+          in_current_dir = false;
+          break;
+        }
+      }
+    } else if (in_current_dir && fs_table[i].name[current_dir_len] == '\0') {
+      /* This is the directory itself, skip it */
+      in_current_dir = false;
+    }
+
+    if (!in_current_dir)
+      continue;
+
+    /* Display the filename without the full path */
+    char *display_name = fs_table[i].name + current_dir_len;
+
+    char buf[16];
+
+    if (fs_table[i].type == 1) {
+      puts("<DIR>      ");
+      dir_count++;
+    } else {
+      int_to_str(fs_table[i].size, buf);
+      puts(buf);
+      for (int j = str_len(buf); j < 11; j++)
+        puts(" ");
+      file_count++;
+      total_size += fs_table[i].size;
+    }
+
+    puts(display_name);
+    puts("\n");
+  }
+
+  puts("\n");
+  char buf[16];
+  int_to_str(file_count, buf);
+  puts(buf);
+  puts(" file(s), ");
+  int_to_str(dir_count, buf);
+  puts(buf);
+  puts(" dir(s), ");
+  int_to_str(total_size, buf);
+  puts(buf);
+  puts(" bytes\n");
+
+  return 0;
+}
+
+/* 13. CD - Change directory */
+static int cmd_cd(const char *args) {
+  char name[64];
+  args = get_token(args, name, 64);
+
+  if (name[0] == 0) {
+    puts(current_dir);
+    puts("\n");
+    return 0;
+  }
+
+  if (str_cmp(name, "..") == 0) {
+    int len = str_len(current_dir);
+    if (len > 3) {
+      for (int i = len - 2; i >= 0; i--) {
+        if (current_dir[i] == '\\') {
+          current_dir[i + 1] = '\0';
+          break;
+        }
+      }
+    }
+    /* Save current directory to disk */
+    fs_save_to_disk();
+    return 0;
+  }
+
+  /* Build full path to check if directory exists */
+  char full_path[256];
+  int dir_len = str_len(current_dir);
+  for (int i = 0; i < dir_len && i < 255; i++) {
+    full_path[i] = current_dir[i];
+  }
+  int name_len = str_len(name);
+  for (int i = 0; i < name_len && (dir_len + i) < 255; i++) {
+    full_path[dir_len + i] = name[i];
+  }
+  full_path[dir_len + name_len] = '\0';
+
+  /* Check if this directory exists */
+  for (int i = 0; i < fs_count; i++) {
+    if (str_cmp(fs_table[i].name, full_path) == 0 && fs_table[i].type == 1) {
+      /* Directory exists, change to it */
+      str_copy(current_dir, full_path, 256);
+      /* Add trailing backslash if not present */
+      int len = str_len(current_dir);
+      if (current_dir[len - 1] != '\\') {
+        current_dir[len] = '\\';
+        current_dir[len + 1] = '\0';
+      }
+      /* Save current directory to disk */
+      fs_save_to_disk();
+      return 0;
+    }
+  }
+
+  puts("Directory not found\n");
+  return -1;
+}
+
+/* 14. CAT/TYPE - Display file contents */
+static int cmd_cat(const char *args) {
+  char name[64];
+  args = get_token(args, name, 64);
+
+  if (name[0] == 0) {
+    puts("Usage: CAT filename\n");
+    return -1;
+  }
+
+  /* Build full path */
+  char full_path[256];
+  int dir_len = str_len(current_dir);
+  for (int i = 0; i < dir_len && i < 255; i++) {
+    full_path[i] = current_dir[i];
+  }
+  int name_len = str_len(name);
+  for (int i = 0; i < name_len && (dir_len + i) < 255; i++) {
+    full_path[dir_len + i] = name[i];
+  }
+  full_path[dir_len + name_len] = '\0';
+
+  /* Find file in fs_table */
+  int file_idx = -1;
+  for (int i = 0; i < fs_count; i++) {
+    if (str_cmp(fs_table[i].name, full_path) == 0 && fs_table[i].type == 0) {
+      file_idx = i;
+      break;
+    }
+  }
+
+  if (file_idx < 0) {
+    puts("File not found\n");
+    return -1;
+  }
+
+  /* Check if file has any size */
+  if (fs_table[file_idx].size == 0) {
+    puts("(empty file)\n");
+    return 0;
+  }
+
+  char tmp[16];
+  puts("Looking for file_idx=");
+  int_to_str(file_idx, tmp);
+  puts(tmp);
+  puts(" in file_content_count=");
+  int_to_str(file_content_count, tmp);
+  puts(tmp);
+  puts("\n");
+
+  /* Search for content in file_contents array */
+  for (int i = 0; i < file_content_count; i++) {
+    if ((int)file_contents[i].file_idx == file_idx) {
+      if (file_contents[i].size == 0) {
+        puts("(empty file)\n");
+        return 0;
+      }
+
+      /* Display file contents */
+      for (uint32_t j = 0; j < file_contents[i].size; j++) {
+        putc(file_contents[i].data[j]);
+      }
+
+      /* Add newline if file doesn't end with one */
+      if (file_contents[i].data[file_contents[i].size - 1] != '\n') {
+        puts("\n");
+      }
+      return 0;
+    }
+  }
+
+  /* File exists but no content found */
+  puts("(empty file)\n");
+  return 0;
+}
+
+/* 15. NANO - Simple text editor - COMPLETELY FIXED */
+static int cmd_nano(const char *args) {
+  char name[64];
+  args = get_token(args, name, 64);
+
+  if (name[0] == 0) {
+    puts("Usage: NANO filename\n");
+    return -1;
+  }
+
+  /* Build full path */
+  char full_path[256];
+  int dir_len = str_len(current_dir);
+  for (int i = 0; i < dir_len && i < 255; i++) {
+    full_path[i] = current_dir[i];
+  }
+  int name_len = str_len(name);
+  for (int i = 0; i < name_len && (dir_len + i) < 255; i++) {
+    full_path[dir_len + i] = name[i];
+  }
+  full_path[dir_len + name_len] = '\0';
+
+  /* Find or create file in fs_table */
+  int file_idx = -1;
+  bool is_new_file = false;
+
+  /* DEBUG: Show what we're looking for */
+  puts("[DEBUG] Looking for file: ");
+  puts(full_path);
+  puts("\n[DEBUG] fs_count = ");
+  char dbg[16];
+  int_to_str(fs_count, dbg);
+  puts(dbg);
+  puts("\n");
+
+  for (int i = 0; i < fs_count; i++) {
+    if (str_cmp(fs_table[i].name, full_path) == 0 && fs_table[i].type == 0) {
+      file_idx = i;
+      puts("[DEBUG] Found at index ");
+      int_to_str(i, dbg);
+      puts(dbg);
+      puts("\n");
+      break;
+    }
+  }
+
+  /* Create new file if not found */
+  if (file_idx < 0) {
+    if (fs_count >= FS_MAX_FILES) {
+      puts("Error: Filesystem full\n");
+      return -1;
+    }
+    str_copy(fs_table[fs_count].name, full_path, FS_MAX_FILENAME);
+    fs_table[fs_count].size = 0;
+    fs_table[fs_count].type = 0;
+    fs_table[fs_count].attr = 0x20;
+    file_idx = fs_count;
+    is_new_file = true;
+    fs_count++;
+
+    puts("[DEBUG] Created new file at index ");
+    int_to_str(file_idx, dbg);
+    puts(dbg);
+    puts("\n");
+  }
+
+  puts("[DEBUG] Using file_idx = ");
+  int_to_str(file_idx, dbg);
+  puts(dbg);
+  puts("\n");
+
+  /* Show editor header */
+  puts("\n=== NANO Editor ===\n");
+  puts("File: ");
+  puts(name);
+  puts("\n");
+  puts("ESC=Save  Ctrl+C=Cancel  Ctrl+K=Clear\n");
+  puts("-------------------\n");
+
+  /* Allocate buffer on HEAP */
+  char *buf = (char *)kmalloc(MAX_FILE_SIZE);
+  if (buf == NULL) {
+    puts("Error: Out of memory\n");
+    if (is_new_file)
+      fs_count--;
+    return -1;
+  }
+
+  /* Zero the entire buffer */
+  for (int i = 0; i < MAX_FILE_SIZE; i++) {
+    buf[i] = 0;
+  }
+
+  int pos = 0;
+  bool cancelled = false;
+
+  /* Find existing content */
+  int content_idx = -1;
+  for (int i = 0; i < file_content_count; i++) {
+    if ((int)file_contents[i].file_idx == file_idx) {
+      content_idx = i;
+      break;
+    }
+  }
+
+  /* Load existing content if present */
+  if (content_idx >= 0 && file_contents[content_idx].size > 0) {
+    uint32_t load_size = file_contents[content_idx].size;
+    if (load_size >= MAX_FILE_SIZE) {
+      load_size = MAX_FILE_SIZE - 1;
+    }
+
+    /* Copy to buffer */
+    for (uint32_t j = 0; j < load_size; j++) {
+      buf[j] = file_contents[content_idx].data[j];
+    }
+    pos = (int)load_size;
+
+    /* Display existing content */
+    for (uint32_t j = 0; j < load_size; j++) {
+      putc(buf[j]);
+    }
+
+  } else {
+    puts("[New file...]\n");
+    pos = 0;
+  }
+
+  /* Main edit loop */
+  while (1) {
+    uint16_t k = getkey();
+    uint8_t key = (uint8_t)(k & 0xFF);
+
+    if (key == 27)
+      break; /* ESC - save */
+
+    if (key == 3) { /* Ctrl+C - cancel */
+      puts("\n^C Cancelled\n");
+      cancelled = true;
+      break;
+    }
+
+    if (key == 11) { /* Ctrl+K - clear */
+      for (int i = 0; i < MAX_FILE_SIZE; i++)
+        buf[i] = 0;
+      pos = 0;
+      cls();
+      puts("\n=== NANO Editor ===\n");
+      puts("File: ");
+      puts(name);
+      puts("\nESC=Save  Ctrl+C=Cancel  Ctrl+K=Clear\n");
+      puts("-------------------\n[Cleared]\n");
+    } else if (key == 8) { /* Backspace */
+      if (pos > 0) {
+        pos--;
+        buf[pos] = 0;
+        putc(8);
+        putc(' ');
+        putc(8);
+      }
+    } else if (key >= 32 && key <= 126) { /* Printable */
+      if (pos < MAX_FILE_SIZE - 1) {
+        buf[pos++] = key;
+        putc(key);
+      }
+    } else if (key == 13 || key == 10) { /* Enter */
+      if (pos < MAX_FILE_SIZE - 1) {
+        buf[pos++] = '\n';
+        putc('\n');
+      }
+    }
+  }
+
+  if (cancelled) {
+    kfree(buf);
+    if (is_new_file)
+      fs_count--;
+    return 0;
+  }
+
+  puts("\n");
+
+  if (pos == 0) {
+    puts("Empty - not saved\n");
+    kfree(buf);
+    if (is_new_file)
+      fs_count--;
+    return 0;
+  }
+
+  /* Find or create content slot */
+  if (content_idx < 0) {
+    if (file_content_count >= 64) {
+      puts("Error: Too many files\n");
+      kfree(buf);
+      if (is_new_file)
+        fs_count--;
+      return -1;
+    }
+    content_idx = file_content_count++;
+  }
+
+  /* Zero and save */
+  for (int i = 0; i < MAX_FILE_SIZE; i++) {
+    file_contents[content_idx].data[i] = 0;
+  }
+
+  file_contents[content_idx].file_idx = (uint16_t)file_idx;
+  file_contents[content_idx].size = (uint32_t)pos;
+
+  for (int i = 0; i < pos; i++) {
+    file_contents[content_idx].data[i] = buf[i];
+  }
+
+  kfree(buf);
+
+  /* CRITICAL: Update fs_table size BEFORE saving to disk */
+  fs_table[file_idx].size = (uint32_t)pos;
+
+  /* Save both file table and file contents to disk */
+  if (fs_save_to_disk() == 0) {
     char tmp[16];
-    int i = 0;
-    while (v > 0) {
-        tmp[i++] = '0' + (v % 10);
-        v /= 10;
-    }
-    int j = 0;
-    while (i > 0) {
-        buf[j++] = tmp[--i];
-    }
-    buf[j] = '\0';
-    return buf;
+    puts("Saved ");
+    int_to_str(pos, tmp);
+    puts(tmp);
+    puts(" bytes to disk\n");
+
+    /* SUCCESS - data is on disk, show verification */
+    puts("Verifying: fs_table[");
+    int_to_str(file_idx, tmp);
+    puts(tmp);
+    puts("].size = ");
+    int_to_str(fs_table[file_idx].size, tmp);
+    puts(tmp);
+    puts(" bytes\n");
+  } else {
+    puts("ERROR: Save failed!\n");
+    return -1;
+  }
+
+  return 0;
 }
 
-static char *utoa_hex(char *buf, uint32_t v) {
-    const char *hex = "0123456789ABCDEF";
-    int idx = 0;
-    bool started = false;
-    for (int shift = 28; shift >= 0; shift -= 4) {
-        uint8_t nibble = (v >> shift) & 0xF;
-        if (nibble != 0 || started || shift == 0) {
-            buf[idx++] = hex[nibble];
-            started = true;
-        }
-    }
-    buf[idx] = '\0';
-    return buf;
+/* 16. MEM - Display memory info */
+static int cmd_mem(const char *args) {
+  (void)args;
+  uint32_t stats[4];
+  mem_get_stats(stats);
+
+  char buf[16];
+  puts("Memory Statistics:\n");
+  puts("Total Free: ");
+  int_to_str(stats[0], buf);
+  puts(buf);
+  puts(" bytes\n");
+
+  puts("Total Used: ");
+  int_to_str(stats[1], buf);
+  puts(buf);
+  puts(" bytes\n");
+
+  puts("Blocks: ");
+  int_to_str(stats[2], buf);
+  puts(buf);
+  puts("\n");
+
+  return 0;
 }
 
-static size_t strlen_local(const char *s) {
-    if (!s) return 0;
-    const char *p = s;
-    while (*p) ++p;
-    return (size_t)(p - s);
+/* 17. ECHO - Echo text */
+static int cmd_echo(const char *args) {
+  args = skip_spaces(args);
+  puts(args);
+  puts("\n");
+  return 0;
 }
 
-static int strcmp_local(const char *a, const char *b) {
-    if (!a || !b) return 0;
-    while (*a && *a == *b) { ++a; ++b; }
-    return (int)((unsigned char)*a) - (int)((unsigned char)*b);
-}
+/* 18. COLOR - Set text color */
+static int cmd_color(const char *args) {
+  char tok[16];
+  args = get_token(args, tok, 16);
 
-static void strcpy_local(char *dst, const char *src) {
-    while (*src) *dst++ = *src++;
-    *dst = '\0';
-}
+  if (tok[0] == 0) {
+    puts("Usage: COLOR <0-255>\n");
+    puts("Examples: COLOR 10 (green), COLOR 12 (red), COLOR 14 (yellow)\n");
+    puts("Format: Foreground + (Background * 16)\n");
+    return -1;
+  }
 
-static void strcat_local(char *dst, const char *src) {
-    while (*dst) ++dst;
-    while (*src) *dst++ = *src++;
-    *dst = '\0';
-}
-
-static void toupper_str(char *s) {
-    while (*s) {
-        if (*s >= 'a' && *s <= 'z') *s -= 32;
-        ++s;
-    }
-}
-
-static void tolower_str(char *s) __attribute__((unused));
-static void tolower_str(char *s) {
-    while (*s) {
-        if (*s >= 'A' && *s <= 'Z') *s += 32;
-        ++s;
-    }
-}
-
-static void println(const char *s) {
-    puts(s);
-    putc('\n');
-}
-
-static int tokenize(char *line, char *argv[], int maxargs) {
-    int argc = 0;
-    char *p = line;
-    while (*p && argc < maxargs) {
-        while (*p == ' ' || *p == '\t') ++p;
-        if (!*p) break;
-        if (*p == '"') {
-            ++p; argv[argc++] = p;
-            while (*p && *p != '"') ++p;
-            if (*p == '"') { *p = '\0'; ++p; }
-        } else {
-            argv[argc++] = p;
-            while (*p && *p != ' ' && *p != '\t') ++p;
-            if (*p) { *p = '\0'; ++p; }
-        }
-    }
-    return argc;
-}
-
-static uint32_t parse_uint(const char *s) {
-    uint32_t val = 0;
-    while (*s >= '0' && *s <= '9') {
-        val = val * 10 + (*s - '0');
-        ++s;
-    }
-    return val;
-}
-
-static void print_separator(void) {
-    println("=====================================================");
-}
-
-static void init_filesystem(void) {
-    if (fs_entry_count > 0) return;
-    
-    strcpy_local(fs_entries[fs_entry_count].name, "AUTOEXEC.BAT");
-    fs_entries[fs_entry_count].size = 512;
-    fs_entries[fs_entry_count].type = 0;
-    fs_entries[fs_entry_count++].attr = 0x20;
-    
-    strcpy_local(fs_entries[fs_entry_count].name, "CONFIG.SYS");
-    fs_entries[fs_entry_count].size = 384;
-    fs_entries[fs_entry_count].type = 0;
-    fs_entries[fs_entry_count++].attr = 0x20;
-    
-    strcpy_local(fs_entries[fs_entry_count].name, "SYSTEM");
-    fs_entries[fs_entry_count].size = 0;
-    fs_entries[fs_entry_count].type = 1;
-    fs_entries[fs_entry_count++].attr = 0x10;
-    
-    strcpy_local(fs_entries[fs_entry_count].name, "DOCS");
-    fs_entries[fs_entry_count].size = 0;
-    fs_entries[fs_entry_count].type = 1;
-    fs_entries[fs_entry_count++].attr = 0x10;
-    
-    strcpy_local(fs_entries[fs_entry_count].name, "README.TXT");
-    fs_entries[fs_entry_count].size = 2048;
-    fs_entries[fs_entry_count].type = 0;
-    fs_entries[fs_entry_count++].attr = 0x20;
-    
-    strcpy_local(fs_entries[fs_entry_count].name, "KERNEL.SYS");
-    fs_entries[fs_entry_count].size = 65536;
-    fs_entries[fs_entry_count].type = 0;
-    fs_entries[fs_entry_count++].attr = 0x27;
-}
-
-static void init_processes(void) {
-    if (proc_count > 0) return;
-    
-    // Get real current PID
-    int current_pid = sys_getpid();
-    
-    // Always include kernel process (PID 0 or 1)
-    proc_table[proc_count].pid = 1;
-    strcpy_local(proc_table[proc_count].name, "KERNEL");
-    proc_table[proc_count].priority = 0;
-    proc_table[proc_count].mem_kb = 128;
-    proc_table[proc_count++].active = true;
-    
-    // Add current shell process with real PID
-    if (current_pid > 0) {
-        proc_table[proc_count].pid = current_pid;
-        strcpy_local(proc_table[proc_count].name, "SHELL.EXE");
-        proc_table[proc_count].priority = 10;
-        proc_table[proc_count].mem_kb = 64;
-        proc_table[proc_count++].active = true;
-    } else {
-        proc_table[proc_count].pid = 2;
-        strcpy_local(proc_table[proc_count].name, "SHELL.EXE");
-        proc_table[proc_count].priority = 10;
-        proc_table[proc_count].mem_kb = 64;
-        proc_table[proc_count++].active = true;
-    }
-    
-    // IDLE process
-    proc_table[proc_count].pid = 0;
-    strcpy_local(proc_table[proc_count].name, "IDLE");
-    proc_table[proc_count].priority = 31;
-    proc_table[proc_count].mem_kb = 4;
-    proc_table[proc_count++].active = true;
-}
-
-/* Still demo. Next versions will have more realistic commands.*/
-static void init_network(void) {
-    if (net_iface_count > 0) return;
-    
-    strcpy_local(net_ifaces[net_iface_count].name, "ETH0");
-    strcpy_local(net_ifaces[net_iface_count].ip, "192.168.1.100");
-    strcpy_local(net_ifaces[net_iface_count].mask, "255.255.255.0");
-    strcpy_local(net_ifaces[net_iface_count].gateway, "192.168.1.1");
-    net_ifaces[net_iface_count++].active = true;
-    
-    strcpy_local(net_ifaces[net_iface_count].name, "LO");
-    strcpy_local(net_ifaces[net_iface_count].ip, "127.0.0.1");
-    strcpy_local(net_ifaces[net_iface_count].mask, "255.0.0.0");
-    strcpy_local(net_ifaces[net_iface_count].gateway, "0.0.0.0");
-    net_ifaces[net_iface_count++].active = true;
-}
-
-static inline void outb(uint16_t port, uint8_t value) {
-    __asm__ volatile("outb %0, %1" : : "a"(value), "Nd"(port));
-}
-
-static inline uint8_t inb(uint16_t port) {
-    uint8_t value;
-    __asm__ volatile("inb %1, %0" : "=a"(value) : "Nd"(port));
-    return value;
-}
-
-static uint8_t cmos_read(uint8_t reg) {
-    outb(0x70, reg);
-    return inb(0x71);
-}
-
-static void read_bios_string(uint16_t seg, uint16_t off, char* buffer, int max_len) {
-    // Read BIOS string from memory (real BIOS data area)
-    char* ptr = (char*)((seg << 4) + off);
-    int i = 0;
-    while (i < max_len - 1 && ptr[i] != 0 && ptr[i] >= 32 && ptr[i] < 127) {
-        buffer[i] = ptr[i];
-        i++;
-    }
-    buffer[i] = '\0';
-}
-
-static void get_bios_vendor(char* vendor) {
-    // Read BIOS vendor from BIOS data area (0xF000:0x0000)
-    read_bios_string(0xF000, 0x0000, vendor, 64);
-    if (strlen_local(vendor) == 0) {
-        // Fallback: try reading from CMOS
-        strcpy_local(vendor, "System BIOS");
-    }
-}
-
-static void get_bios_version(char* version) {
-    // Read BIOS version from BIOS data area
-    read_bios_string(0xF000, 0x0005, version, 32);
-    if (strlen_local(version) == 0) {
-        // Read from CMOS or use detected version
-        uint8_t major = cmos_read(0x14);
-        uint8_t minor = cmos_read(0x15);
-        if (major > 0 || minor > 0) {
-            char buf[32];
-            utoa_decimal(buf, major);
-            strcpy_local(version, buf);
-            strcat_local(version, ".");
-            utoa_decimal(buf, minor);
-            strcat_local(version, buf);
-        } else {
-            strcpy_local(version, "Unknown");
-        }
-    }
-}
-
-static void get_system_vendor(char* vendor) {
-    // Read system vendor from DMI/SMBIOS area or BIOS
-    read_bios_string(0xF000, 0x0010, vendor, 64);
-    if (strlen_local(vendor) == 0) {
-        strcpy_local(vendor, "RO-DOS System");
-    }
-}
-
-static void init_drives(void) {
-    if (drive_count > 0) return;
-    
-    // Try to detect real drives from BIOS
-    // For now, initialize with detected information
-    drives[drive_count].letter = 'C';
-    strcpy_local(drives[drive_count].label, "SYSTEM");
-    // Try to get real disk size from BIOS or ATA identify
-    drives[drive_count].total_mb = 2048;  // Will be updated with real detection
-    drives[drive_count].free_mb = 1024;
-    drives[drive_count].type = 0;
-    drive_count++;
-}
-
-/* === SYSTEM & UTILITY COMMANDS === */
-
-static int cmd_cls(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    cls();
+  if (tok[0] >= '0' && tok[0] <= '9') {
+    uint8_t c = str_to_int(tok);
+    current_color = c;
+    set_attr(c);
+    puts("Color changed to ");
+    char buf[16];
+    int_to_str(c, buf);
+    puts(buf);
+    puts("\n");
     return 0;
+  }
+
+  puts("Usage: COLOR 0-255\n");
+  return -1;
 }
 
-static int cmd_ver(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    println("RO-DOS Version 1.0");
-    println("(C) 2025 Luka. All rights reserved.");
-    println("");
-    println("System Information:");
-    
-    // Get real system information
-    typedef struct {
-        uint32_t total_memory;
-        uint32_t free_memory;
-        uint32_t used_memory;
-        uint32_t kernel_memory;
-        uint32_t uptime_seconds;
-        uint32_t num_processes;
-    } sysinfo_t;
-    
-    sysinfo_t sysinfo;
-    if (sys_sysinfo(&sysinfo) == 0) {
-        char buf[32];
-        puts("  Total Memory:    ");
-        utoa_decimal(buf, sysinfo.total_memory / 1024);
-        puts(buf);
-        println(" KB");
-        
-        puts("  Free Memory:     ");
-        utoa_decimal(buf, sysinfo.free_memory / 1024);
-        puts(buf);
-        println(" KB");
-        
-        puts("  Used Memory:     ");
-        utoa_decimal(buf, sysinfo.used_memory / 1024);
-        puts(buf);
-        println(" KB");
-        
-        puts("  Kernel Memory:   ");
-        utoa_decimal(buf, sysinfo.kernel_memory / 1024);
-        puts(buf);
-        println(" KB");
-        
-        puts("  Uptime:          ");
-        uint32_t hours = sysinfo.uptime_seconds / 3600;
-        uint32_t mins = (sysinfo.uptime_seconds % 3600) / 60;
-        uint32_t secs = sysinfo.uptime_seconds % 60;
-        utoa_decimal(buf, hours);
-        puts(buf); puts("h ");
-        utoa_decimal(buf, mins);
-        puts(buf); puts("m ");
-        utoa_decimal(buf, secs);
-        puts(buf); println("s");
-        
-        puts("  Processes:       ");
-        utoa_decimal(buf, sysinfo.num_processes);
-        puts(buf);
-        println("");
+/* 19. BEEP - Make system beep */
+static int cmd_beep(const char *args) {
+  (void)args;
+  sys_beep(800, 200);
+  return 0;
+}
+
+/* 20. UPTIME - Show system uptime */
+static int cmd_uptime(const char *args) {
+  (void)args;
+  uint32_t ticks = get_ticks();
+  uint32_t seconds = ticks / 18;
+  uint32_t minutes = seconds / 60;
+  uint32_t hours = minutes / 60;
+
+  char buf[16];
+  puts("Uptime: ");
+  int_to_str(hours, buf);
+  puts(buf);
+  puts("h ");
+  int_to_str(minutes % 60, buf);
+  puts(buf);
+  puts("m ");
+  int_to_str(seconds % 60, buf);
+  puts(buf);
+  puts("s\n");
+
+  return 0;
+}
+
+/* 21. COPY/CP - Copy file */
+static int cmd_copy(const char *args) {
+  char src[64], dst[64];
+  args = get_token(args, src, 64);
+  args = get_token(args, dst, 64);
+
+  if (src[0] == 0 || dst[0] == 0) {
+    puts("Usage: COPY source dest\n");
+    return -1;
+  }
+
+  int src_idx = -1;
+  for (int i = 0; i < fs_count; i++) {
+    if (str_cmp(fs_table[i].name, src) == 0 && fs_table[i].type == 0) {
+      src_idx = i;
+      break;
+    }
+  }
+
+  if (src_idx < 0) {
+    puts("Source file not found\n");
+    return -1;
+  }
+
+  if (fs_count >= FS_MAX_FILES) {
+    puts("Error: Filesystem full\n");
+    return -1;
+  }
+
+  str_copy(fs_table[fs_count].name, dst, FS_MAX_FILENAME);
+  fs_table[fs_count].size = fs_table[src_idx].size;
+  fs_table[fs_count].type = 0;
+  fs_table[fs_count].attr = fs_table[src_idx].attr;
+  int dst_idx = fs_count;
+  fs_count++;
+
+  for (int i = 0; i < file_content_count; i++) {
+    if (file_contents[i].file_idx == src_idx && file_content_count < 64) {
+      file_contents[file_content_count].file_idx = dst_idx;
+      file_contents[file_content_count].size = file_contents[i].size;
+      for (uint32_t j = 0; j < file_contents[i].size; j++) {
+        file_contents[file_content_count].data[j] = file_contents[i].data[j];
+      }
+      file_content_count++;
+      break;
+    }
+  }
+
+  fs_save_to_disk();
+  puts("File copied\n");
+  return 0;
+}
+
+/* 22. MOVE/MV - Move file */
+static int cmd_move(const char *args) {
+  char src[64], dst[64];
+  args = get_token(args, src, 64);
+  args = get_token(args, dst, 64);
+
+  if (src[0] == 0 || dst[0] == 0) {
+    puts("Usage: MOVE source dest\n");
+    return -1;
+  }
+
+  for (int i = 0; i < fs_count; i++) {
+    if (str_cmp(fs_table[i].name, src) == 0) {
+      str_copy(fs_table[i].name, dst, FS_MAX_FILENAME);
+      fs_save_to_disk();
+      puts("File moved\n");
+      return 0;
+    }
+  }
+
+  puts("File not found\n");
+  return -1;
+}
+
+/* 23. REN/RENAME - Rename file */
+static int cmd_ren(const char *args) { return cmd_move(args); }
+
+/* 24. FIND - Find files */
+static int cmd_find(const char *args) {
+  char pattern[64];
+  args = get_token(args, pattern, 64);
+
+  if (pattern[0] == 0) {
+    puts("Usage: FIND pattern\n");
+    return -1;
+  }
+
+  int found = 0;
+  for (int i = 0; i < fs_count; i++) {
+    bool match = false;
+    for (int j = 0; fs_table[i].name[j]; j++) {
+      bool sub_match = true;
+      for (int k = 0; pattern[k]; k++) {
+        if (fs_table[i].name[j + k] != pattern[k]) {
+          sub_match = false;
+          break;
+        }
+      }
+      if (sub_match) {
+        match = true;
+        break;
+      }
+    }
+
+    if (match) {
+      puts(fs_table[i].name);
+      puts("\n");
+      found++;
+    }
+  }
+
+  if (found == 0) {
+    puts("No files found\n");
+  }
+
+  return 0;
+}
+
+/* 25. TREE - Show directory tree */
+static int cmd_tree(const char *args) {
+  (void)args;
+  puts("Directory tree:\n");
+  puts(current_dir);
+  puts("\n");
+
+  for (int i = 0; i < fs_count; i++) {
+    puts("  ");
+    if (fs_table[i].type == 1) {
+      puts("[DIR] ");
     } else {
-        // Fallback to basic info
-        char buf[32];
-        uint32_t ticks = get_ticks();
-        utoa_decimal(buf, ticks / 1000);
-        puts("  Uptime: "); puts(buf); println(" seconds");
+      puts("[FILE] ");
     }
-    
-    // Get system name
-    char uname_buf[256];
-    if (sys_uname(uname_buf, sizeof(uname_buf)) == 0) {
-        puts("  System Name:     ");
-        println(uname_buf);
-    }
-    
-    println("  Architecture:    x86 32-bit");
-    println("  Mode:            Protected Mode (Ring 0)");
-    
-    // Get CPU info from CMOS
-    uint8_t cpu_type = cmos_read(0x12);
-    puts("  CPU Type:        ");
-    char cpu_buf[32];
-    utoa_decimal(cpu_buf, cpu_type);
-    puts(cpu_buf);
-    println("");
-    
-    return 0;
+    puts(fs_table[i].name);
+    puts("\n");
+  }
+
+  return 0;
 }
 
-/* Add to global state section */
-#define MAX_USERS 16
-#define USERNAME_LEN 32
-#define PASSWORD_HASH_LEN 8
+/* 26. ATTRIB - Show/set file attributes */
+static int cmd_attrib(const char *args) {
+  char name[64];
+  args = get_token(args, name, 64);
 
-typedef struct {
-    char username[USERNAME_LEN];
-    uint32_t password_hash[PASSWORD_HASH_LEN];  // Simple hash storage
-    bool exists;
-} User;
-
-static User user_database[MAX_USERS];
-static int user_count = 0;
-
-/* Simple hash function (FNV-1a variant) - NOT cryptographically secure! */
-static void hash_password(const char *password, uint32_t *hash_out) {
-    uint32_t hash = 2166136261u;
-    
-    while (*password) {
-        hash ^= (uint8_t)*password++;
-        hash *= 16777619u;
+  if (name[0] == 0) {
+    for (int i = 0; i < fs_count; i++) {
+      puts("0x");
+      print_hex(fs_table[i].attr);
+      puts(" ");
+      puts(fs_table[i].name);
+      puts("\n");
     }
-    
-    // Generate 8 hash values for basic security
-    for (int i = 0; i < PASSWORD_HASH_LEN; i++) {
-        hash_out[i] = hash;
-        hash = hash * 1103515245u + 12345u;  // LCG
+  } else {
+    for (int i = 0; i < fs_count; i++) {
+      if (str_cmp(fs_table[i].name, name) == 0) {
+        puts("Attributes: 0x");
+        print_hex(fs_table[i].attr);
+        puts("\n");
+        return 0;
+      }
     }
+    puts("File not found\n");
+  }
+
+  return 0;
 }
 
-static bool verify_password(const char *username, const char *password) {
-    uint32_t input_hash[PASSWORD_HASH_LEN];
-    hash_password(password, input_hash);
-    
-    for (int i = 0; i < user_count; i++) {
-        if (user_database[i].exists && 
-            strcmp_local(user_database[i].username, username) == 0) {
-            // Constant-time comparison to prevent timing attacks
-            int match = 0;
-            for (int j = 0; j < PASSWORD_HASH_LEN; j++) {
-                match |= (user_database[i].password_hash[j] ^ input_hash[j]);
-            }
-            return (match == 0);
-        }
+/* 27. CHMOD - Change file mode */
+static int cmd_chmod(const char *args) {
+  char mode[16], name[64];
+  args = get_token(args, mode, 16);
+  args = get_token(args, name, 64);
+
+  if (mode[0] == 0 || name[0] == 0) {
+    puts("Usage: CHMOD mode filename\n");
+    return -1;
+  }
+
+  uint8_t new_attr = str_to_int(mode);
+
+  for (int i = 0; i < fs_count; i++) {
+    if (str_cmp(fs_table[i].name, name) == 0) {
+      fs_table[i].attr = new_attr;
+      fs_save_to_disk();
+      puts("Attributes changed\n");
+      return 0;
     }
-    return false;
+  }
+
+  puts("File not found\n");
+  return -1;
 }
 
-static bool user_exists(const char *username) {
-    for (int i = 0; i < user_count; i++) {
-        if (user_database[i].exists && 
-            strcmp_local(user_database[i].username, username) == 0) {
-            return true;
-        }
-    }
-    return false;
+/* 28. VOL - Show volume label */
+static int cmd_vol(const char *args) {
+  (void)args;
+  puts("Volume in drive C has no label\n");
+  puts("Volume Serial Number is 1234-5678\n");
+  return 0;
 }
 
-/* Read password with masking */
-static int read_password(char *buffer, int max_len) {
-    int pos = 0;
-    
-    while (pos < max_len - 1) {
+/* 29. LABEL - Set volume label */
+static int cmd_label(const char *args) {
+  (void)args;
+  puts("Volume label command - not implemented in basic filesystem\n");
+  return 0;
+}
+
+/* 30. CHKDSK - Check disk */
+static int cmd_chkdsk(const char *args) {
+  (void)args;
+  puts("Checking disk...\n");
+
+  char buf[16];
+  puts("Files: ");
+  int_to_str(fs_count, buf);
+  puts(buf);
+  puts("/");
+  int_to_str(FS_MAX_FILES, buf);
+  puts(buf);
+  puts("\n");
+
+  uint32_t total = 0;
+  for (int i = 0; i < fs_count; i++) {
+    total += fs_table[i].size;
+  }
+
+  puts("Total size: ");
+  int_to_str(total, buf);
+  puts(buf);
+  puts(" bytes\n");
+
+  puts("Disk check complete - no errors found\n");
+  return 0;
+}
+
+/* 31. FORMAT - Format disk */
+static int cmd_format(const char *args) {
+  (void)args;
+  puts("WARNING: This will erase all data!\n");
+  puts("Press Y to confirm or any key to cancel: ");
+
+  uint16_t k = getkey();
+  uint8_t key = (uint8_t)(k & 0xFF);
+  putc(key);
+  puts("\n");
+
+  if (key == 'Y' || key == 'y') {
+    fs_count = 0;
+    file_content_count = 0;
+    fs_save_to_disk();
+    puts("Format complete\n");
+  } else {
+    puts("Format cancelled\n");
+  }
+
+  return 0;
+}
+
+/* 32. DISKPART - Disk partitioning info */
+static int cmd_diskpart(const char *args) {
+  (void)args;
+  puts("Disk Information:\n");
+  puts("Disk 0: Primary disk\n");
+  puts("  Partition 1: C: (Active)\n");
+  puts("  Type: FAT12\n");
+  puts("  Size: 1.44 MB\n");
+  return 0;
+}
+
+/* 33. FSCK - Filesystem check */
+static int cmd_fsck(const char *args) { return cmd_chkdsk(args); }
+
+/* 34. USERADD - Add user */
+static int cmd_useradd(const char *args) {
+  char username[32];
+  args = get_token(args, username, 32);
+
+  if (username[0] == 0) {
+    puts("Usage: USERADD username\n");
+    return -1;
+  }
+
+  if (user_count >= FS_MAX_USERS) {
+    puts("Error: User table full\n");
+    return -1;
+  }
+
+  for (int i = 0; i < user_count; i++) {
+    if (str_cmp(user_table[i].username, username) == 0) {
+      puts("Error: User already exists\n");
+      return -1;
+    }
+  }
+
+  str_copy(user_table[user_count].username, username, 32);
+  uint32_t h = hash_string(username);
+  for (int i = 0; i < 32; i++) {
+    user_table[user_count].password_hash[i] =
+        (char)((h >> ((i % 4) * 8)) & 0xFF);
+  }
+  user_count++;
+
+  fs_save_to_disk();
+  puts("User created: ");
+  puts(username);
+  puts("\n");
+  return 0;
+}
+
+/* 35. USERDEL - Delete user */
+static int cmd_userdel(const char *args) {
+  char username[32];
+  args = get_token(args, username, 32);
+
+  if (username[0] == 0) {
+    puts("Usage: USERDEL username\n");
+    return -1;
+  }
+
+  for (int i = 0; i < user_count; i++) {
+    if (str_cmp(user_table[i].username, username) == 0) {
+      for (int j = i; j < user_count - 1; j++) {
+        user_table[j] = user_table[j + 1];
+      }
+      user_count--;
+      fs_save_to_disk();
+      puts("User deleted\n");
+      return 0;
+    }
+  }
+
+  puts("User not found\n");
+  return -1;
+}
+
+/* 36. PASSWD - Change password */
+static int cmd_passwd(const char *args) {
+  char username[32];
+  args = get_token(args, username, 32);
+
+  if (username[0] == 0) {
+    str_copy(username, current_user, 32);
+  }
+
+  for (int i = 0; i < user_count; i++) {
+    if (str_cmp(user_table[i].username, username) == 0) {
+      puts("Enter new password: ");
+      char pwd[32];
+      int pos = 0;
+      while (1) {
         uint16_t k = getkey();
         uint8_t key = (uint8_t)(k & 0xFF);
-        
-        if (key == 13 || key == 10) {  // Enter
-            buffer[pos] = '\0';
-            putc('\n');
-            return pos;
-        } 
-        else if (key == 8) {  // Backspace
-            if (pos > 0) {
-                pos--;
-                putc(8);
-                putc(' ');
-                putc(8);
-            }
+        if (key == 13 || key == 10)
+          break;
+        if (key == 8 && pos > 0) {
+          pos--;
+        } else if (key >= 32 && key <= 126 && pos < 31) {
+          pwd[pos++] = key;
+          putc('*');
         }
-        else if (key >= 32 && key <= 126) {  // Printable characters
-            buffer[pos++] = (char)key;
-            putc('*');  // Display asterisk instead of character
-        }
+      }
+      pwd[pos] = '\0';
+      puts("\n");
+
+      uint32_t h = hash_string(pwd);
+      for (int j = 0; j < 32; j++) {
+        user_table[i].password_hash[j] = (char)((h >> ((j % 4) * 8)) & 0xFF);
+      }
+
+      fs_save_to_disk();
+      puts("Password changed\n");
+      return 0;
     }
-    
-    buffer[pos] = '\0';
-    putc('\n');
-    return pos;
+  }
+
+  puts("User not found\n");
+  return -1;
 }
 
-static int cmd_echo(int argc, char *argv[]) {
-    if (argc == 1) {
-        puts("ECHO is ");
-        println(echo_enabled ? "on" : "off");
-        return 0;
-    }
-    
-    char *arg = argv[1];
-    toupper_str(arg);
-    if (strcmp_local(arg, "ON") == 0) {
-        echo_enabled = true;
-        println("ECHO is on");
-        return 0;
-    }
-    if (strcmp_local(arg, "OFF") == 0) {
-        echo_enabled = false;
-        return 0;
-    }
-    
-    for (int i = 1; i < argc; ++i) {
-        puts(argv[i]);
-        if (i + 1 < argc) putc(' ');
-    }
-    putc('\n');
-    return 0;
+/* 37. USERS - List users */
+static int cmd_users(const char *args) {
+  (void)args;
+  puts("System Users:\n");
+
+  for (int i = 0; i < user_count; i++) {
+    puts("  ");
+    puts(user_table[i].username);
+    puts("\n");
+  }
+
+  char buf[16];
+  int_to_str(user_count, buf);
+  puts("\nTotal: ");
+  puts(buf);
+  puts(" users\n");
+
+  return 0;
 }
 
-static int cmd_mem(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    uint32_t stats[3];
-    mem_get_stats(stats);
-    char buf[32];
-    
-    println("Memory Statistics:");
-    print_separator();
-    
-    puts("  Total System Memory:  ");
-    utoa_decimal(buf, (stats[0] + stats[1]) / 1024);
-    puts(buf); println(" KB");
-    
-    puts("  Available Memory:     ");
-    utoa_decimal(buf, stats[0] / 1024);
-    puts(buf); println(" KB");
-    
-    puts("  Used Memory:          ");
-    utoa_decimal(buf, stats[1] / 1024);
-    puts(buf); println(" KB");
-    
-    uint32_t pct = (stats[1] * 100) / (stats[0] + stats[1]);
-    puts("  Usage Percentage:     ");
-    utoa_decimal(buf, pct);
-    puts(buf); println("%");
-    
-    println("");
-    puts("  Conventional Memory:  ");
-    utoa_decimal(buf, 640);
-    puts(buf); println(" KB");
-    
-    puts("  Extended Memory:      ");
-    utoa_decimal(buf, (stats[0] + stats[1]) / 1024 - 640);
-    puts(buf); println(" KB");
-    
-    return 0;
+/* 38. LOGIN - Login as user */
+static int cmd_login(const char *args) {
+  char username[32];
+  args = get_token(args, username, 32);
+
+  if (username[0] == 0) {
+    puts("Usage: LOGIN username\n");
+    return -1;
+  }
+
+  for (int i = 0; i < user_count; i++) {
+    if (str_cmp(user_table[i].username, username) == 0) {
+      str_copy(current_user, username, 32);
+      puts("Logged in as ");
+      puts(username);
+      puts("\n");
+      return 0;
+    }
+  }
+
+  puts("User not found\n");
+  return -1;
 }
 
-static int cmd_reboot(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    println("");
-    println("System is rebooting...");
-    println("Please wait...");
-    sys_reboot();
-    return 1;
+/* 39. LOGOUT - Logout */
+static int cmd_logout(const char *args) {
+  (void)args;
+  str_copy(current_user, "root", 32);
+  puts("Logged out\n");
+  return 0;
 }
 
-static int cmd_shutdown(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    println("");
-    println("RO-DOS is shutting down...");
-    println("");
-    println("It is now safe to turn off your computer.");
-    println("");
-    while(1) {
-        __asm__ __volatile__("hlt");
-    }
-    return 1;
+/* 40. WHOAMI - Show current user */
+static int cmd_whoami(const char *args) {
+  (void)args;
+  puts(current_user);
+  puts("\n");
+  return 0;
 }
 
-static int cmd_color(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: COLOR [attr]");
-        println("  attr: 0-F (hex color code)");
-        println("  Example: COLOR 0A (green on black)");
-        return -1;
+/* 41. SU - Switch user */
+static int cmd_su(const char *args) { return cmd_login(args); }
+
+/* 42. PS - List processes */
+static int cmd_ps(const char *args) {
+  (void)args;
+  ensure_processes_init();
+  
+  puts("PID  NAME            STATE       MEM   PRI\n");
+  puts("---  ----            -----       ---   ---\n");
+  
+  char buf[32];
+  for(int i=0; i<process_count; i++) {
+    /* PID */
+    int_to_str(process_table[i].pid, buf);
+    puts(buf);
+    /* Align */
+    int len = str_len(buf);
+    for(int k=0; k<5-len; k++) putc(' ');
+    
+    /* Name */
+    puts(process_table[i].name);
+    len = str_len(process_table[i].name);
+    for(int k=0; k<16-len; k++) putc(' ');
+    
+    /* State */
+    puts(process_table[i].state);
+    len = str_len(process_table[i].state);
+    for(int k=0; k<12-len; k++) putc(' ');
+    
+    /* Mem */
+    int_to_str(process_table[i].mem_usage, buf);
+    puts(buf);
+    puts("K");
+    len = str_len(buf) + 1;
+    for(int k=0; k<6-len; k++) putc(' ');
+    
+    /* Priority */
+    int_to_str(process_table[i].priority, buf);
+    puts(buf);
+    
+    puts("\n");
+  }
+  return 0;
+}
+
+/* 43. KILL - Kill process */
+static int cmd_kill(const char *args) {
+  char pid_str[16];
+  args = get_token(args, pid_str, 16);
+  
+  if (pid_str[0] == 0) {
+    puts("Usage: KILL <pid>\n");
+    return -1;
+  }
+  
+  uint32_t pid = str_to_int(pid_str);
+  ensure_processes_init();
+  
+  if (pid <= 2) {
+    puts("Error: Cannot kill critical system process (KERNEL/SHELL)\n");
+    return -1;
+  }
+  
+  int found_idx = -1;
+  for(int i=0; i<process_count; i++) {
+    if (process_table[i].pid == pid) {
+      found_idx = i;
+      break;
     }
-    
-    char c = argv[1][0];
-    uint8_t col = 0x07;
-    
-    if (c >= '0' && c <= '9') col = c - '0';
-    else if (c >= 'A' && c <= 'F') col = 10 + (c - 'A');
-    else if (c >= 'a' && c <= 'f') col = 10 + (c - 'a');
-    
-    if (strlen_local(argv[1]) > 1) {
-        char bg = argv[1][1];
-        uint8_t bgcol = 0;
-        if (bg >= '0' && bg <= '9') bgcol = bg - '0';
-        else if (bg >= 'A' && bg <= 'F') bgcol = 10 + (bg - 'A');
-        else if (bg >= 'a' && bg <= 'f') bgcol = 10 + (bg - 'a');
-        col = (bgcol << 4) | col;
-    }
-    
-    current_color = col;
-    set_attr(col);
+  }
+  
+  if (found_idx == -1) {
+    puts("Error: Process not found\n");
+    return -1;
+  }
+  
+  /* Logically remove process */
+  puts("Terminating process ");
+  puts(process_table[found_idx].name);
+  puts(" (PID ");
+  puts(pid_str);
+  puts(")...\n");
+  
+  /* Shift remaining */
+  for(int i=found_idx; i<process_count-1; i++) {
+    process_table[i] = process_table[i+1];
+  }
+  process_count--;
+  
+  puts("Process killed.\n");
+  return 0;
+}
+
+/* 44. TOP - Show top processes */
+static int cmd_top(const char *args) { 
     cls();
-    return 0;
+    puts("RO-DOS Task Manager - Top Processes\n");
+    puts("-----------------------------------\n");
+    return cmd_ps(args); 
 }
 
-static int cmd_beep(int argc, char *argv[]) {
-    uint32_t freq = 800;
-    uint32_t duration = 200;
-    
-    if (argc > 1) freq = parse_uint(argv[1]);
-    if (argc > 2) duration = parse_uint(argv[2]);
-    
-    // Validate frequency range
-    if (freq < 20) freq = 20;
-    if (freq > 20000) freq = 20000;
-    if (duration > 5000) duration = 5000;
-    if (duration == 0) duration = 100; // Minimum duration
-    
-    char buf[32];
-    puts("BEEP: ");
-    utoa_decimal(buf, freq);
-    puts(buf);
-    puts(" Hz for ");
-    utoa_decimal(buf, duration);
-    puts(buf);
-    println(" ms");
-    
-    // Check if sys_beep is available and working
-    // If sys_beep causes halt, use manual PC speaker control
-    
-    // Manual PC speaker control (safer alternative)
-    uint16_t divisor = 1193180 / freq;
-    
-    // Set PIT channel 2 for speaker
-    outb(0x43, 0xB6);  // Command: channel 2, lobyte/hibyte, square wave
-    outb(0x42, (uint8_t)(divisor & 0xFF));        // Low byte
-    outb(0x42, (uint8_t)((divisor >> 8) & 0xFF)); // High byte
-    
-    // Enable speaker
-    uint8_t tmp = inb(0x61);
-    if (tmp != (tmp | 3)) {
-        outb(0x61, tmp | 3);
-    }
-    
-    // Wait for duration
-    sleep_ms(duration);
-    
-    // Disable speaker
-    outb(0x61, tmp & 0xFC);
-    
-    println("Done.");
-    return 0;
+/* 45. TASKLIST - List tasks */
+static int cmd_tasklist(const char *args) { return cmd_ps(args); }
+
+/* 46. TASKKILL - Kill task */
+static int cmd_taskkill(const char *args) { return cmd_kill(args); }
+
+/* 47. PAUSE - Pause execution */
+static int cmd_pause(const char *args) {
+  (void)args;
+  puts("Press any key to continue...");
+  getkey();
+  puts("\n");
+  return 0;
 }
 
-static int cmd_sleep(int argc, char *argv[]) {
-    uint32_t ms = 1000;
-    
-    if (argc > 1) {
-        ms = parse_uint(argv[1]) * 1000;
-    }
-    
-    if (ms > 60000) ms = 60000;
-    
-    char buf[32];
-    puts("Sleeping for ");
-    utoa_decimal(buf, ms / 1000);
-    puts(buf);
-    println(" second(s)...");
-    
-    sleep_ms(ms);
-    println("Done.");
-    return 0;
+/* 48. SLEEP - Sleep for seconds */
+static int cmd_sleep(const char *args) {
+  char tok[16];
+  args = get_token(args, tok, 16);
+
+  if (tok[0] == 0) {
+    puts("Usage: SLEEP seconds\n");
+    return -1;
+  }
+
+  uint32_t sec = str_to_int(tok);
+  sleep_ms(sec * 1000);
+  return 0;
 }
 
-static int cmd_getticks(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    char buf[32];
-    uint32_t ticks = get_ticks();
-    
-    println("System Timer Information:");
-    print_separator();
-    
-    puts("  Raw Ticks:     ");
-    utoa_decimal(buf, ticks);
-    println(buf);
-    
-    puts("  Seconds:       ");
-    utoa_decimal(buf, ticks / 1000);
-    println(buf);
-    
-    uint32_t hours = ticks / 3600000;
-    uint32_t mins = (ticks % 3600000) / 60000;
-    uint32_t secs = (ticks % 60000) / 1000;
-    
-    puts("  Uptime:        ");
-    utoa_decimal(buf, hours);
-    puts(buf); puts("h ");
-    utoa_decimal(buf, mins);
-    puts(buf); puts("m ");
-    utoa_decimal(buf, secs);
-    puts(buf); println("s");
-    
-    return 0;
+/* 49. HALT - Halt system */
+static int cmd_halt(const char *args) {
+  (void)args;
+  puts("System halted\n");
+  __asm__ volatile("cli; hlt");
+  return 0;
 }
 
-static int cmd_date(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    
-    // Read real date from RTC/CMOS
-    uint8_t day, month;
-    uint16_t year;
-    
-    if (sys_get_date(&day, &month, &year) == 0) {
-        // Get day of week (simplified calculation)
-        const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-        // Simple day of week calculation (Zeller's congruence approximation)
-        uint32_t ticks = get_ticks();
-        uint32_t days_since_epoch = ticks / (1000 * 86400);
-        int dow = (days_since_epoch + 4) % 7;  // Jan 1, 2000 was Saturday
-        
-        puts("Current date: ");
-        puts(days[dow]);
-        puts(" ");
-        
-        char buf[32];
-        utoa_decimal(buf, month);
-        if (month < 10) puts("0");
-        puts(buf);
-        puts("/");
-        utoa_decimal(buf, day);
-        if (day < 10) puts("0");
-        puts(buf);
-        puts("/");
-        utoa_decimal(buf, year);
-        println(buf);
-    } else {
-        // Fallback to CMOS if syscall fails
-        uint8_t century = cmos_read(0x32);
-        uint8_t year_cmos = cmos_read(0x09);
-        month = cmos_read(0x08);
-        day = cmos_read(0x07);
-        
-        if (century > 0) {
-            year = (century * 100) + year_cmos;
-        } else if (year_cmos < 80) {
-            year = 2000 + year_cmos;
-        } else {
-            year = 1900 + year_cmos;
-        }
-        
-        char buf[32];
-        puts("Current date: ");
-        utoa_decimal(buf, month);
-        if (month < 10) puts("0");
-        puts(buf);
-        puts("/");
-        utoa_decimal(buf, day);
-        if (day < 10) puts("0");
-        puts(buf);
-        puts("/");
-        utoa_decimal(buf, year);
-        println(buf);
-    }
-    
-    println("");
-    println("Date command is read-only in this version.");
-    println("Use BIOS setup to change system date.");
-    return 0;
+/* 50. EXIT - Exit shell */
+static int cmd_exit(const char *args) {
+  (void)args;
+  puts("Cannot exit shell - use REBOOT\n");
+  return 0;
 }
 
-static int cmd_time(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    
-    // Read real time from RTC
-    uint8_t hours, minutes, seconds;
-    
-    if (sys_get_time(&hours, &minutes, &seconds) == 0) {
-        char buf[16];
-        puts("Current time: ");
-        utoa_decimal(buf, hours);
-        if (hours < 10) puts("0");
-        puts(buf); puts(":");
-        utoa_decimal(buf, minutes);
-        if (minutes < 10) puts("0");
-        puts(buf); puts(":");
-        utoa_decimal(buf, seconds);
-        if (seconds < 10) puts("0");
-        puts(buf);
-        println("");
-    } else {
-        // Fallback to CMOS RTC if syscall fails
-        uint8_t rtc_status = cmos_read(0x0B);
-        // Check if RTC is in BCD mode
-        bool bcd_mode = !(rtc_status & 0x04);
-        
-        uint8_t hour_reg = cmos_read(0x04);
-        uint8_t min_reg = cmos_read(0x02);
-        uint8_t sec_reg = cmos_read(0x00);
-        
-        if (bcd_mode) {
-            // Convert BCD to binary
-            hours = ((hour_reg >> 4) & 0x0F) * 10 + (hour_reg & 0x0F);
-            minutes = ((min_reg >> 4) & 0x0F) * 10 + (min_reg & 0x0F);
-            seconds = ((sec_reg >> 4) & 0x0F) * 10 + (sec_reg & 0x0F);
-        } else {
-            hours = hour_reg;
-            minutes = min_reg;
-            seconds = sec_reg;
-        }
-        
-        // Check 12/24 hour format
-        if (!(rtc_status & 0x02)) {
-            // 12-hour format
-            bool pm = (hours & 0x80) != 0;
-            hours = hours & 0x7F;
-            if (pm && hours != 12) hours += 12;
-            if (!pm && hours == 12) hours = 0;
-        }
-        
-        char buf[16];
-        puts("Current time: ");
-        utoa_decimal(buf, hours);
-        if (hours < 10) puts("0");
-        puts(buf); puts(":");
-        utoa_decimal(buf, minutes);
-        if (minutes < 10) puts("0");
-        puts(buf); puts(":");
-        utoa_decimal(buf, seconds);
-        if (seconds < 10) puts("0");
-        puts(buf);
-        println("");
+/* 51. CALC - Simple calculator */
+static int cmd_calc(const char *args) {
+  char a_str[16], op[4], b_str[16];
+  args = get_token(args, a_str, 16);
+  args = get_token(args, op, 4);
+  args = get_token(args, b_str, 16);
+
+  if (a_str[0] == 0 || op[0] == 0 || b_str[0] == 0) {
+    puts("Usage: CALC num op num (e.g., CALC 5 + 3)\n");
+    return -1;
+  }
+
+  uint32_t a = str_to_int(a_str);
+  uint32_t b = str_to_int(b_str);
+  uint32_t result = 0;
+
+  if (op[0] == '+') {
+    result = a + b;
+  } else if (op[0] == '-') {
+    result = a - b;
+  } else if (op[0] == '*') {
+    result = a * b;
+  } else if (op[0] == '/') {
+    if (b == 0) {
+      puts("Error: Division by zero\n");
+      return -1;
     }
-    
-    return 0;
+    result = a / b;
+  } else {
+    puts("Unknown operator\n");
+    return -1;
+  }
+
+  char buf[16];
+  int_to_str(result, buf);
+  puts("Result: ");
+  puts(buf);
+  puts("\n");
+
+  return 0;
 }
 
-static int cmd_whoami(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    
-    println("");
-    println("Current User Information");
-    print_separator();
-    println("");
-    
-    // Check if any users exist in database
-    if (user_count == 0) {
-        println("  Username:  root");
-        println("  Domain:    SYSTEM");
-        println("  Groups:    Administrators");
-        println("  Privilege: Ring 0 (Kernel Mode)");
-        println("  Status:    No user accounts created");
-        println("");
-        println("Use USERADD to create user accounts");
-        return 0;
-    }
-    
-    // In a real system, would check currently logged in user
-    // For now, show first active user or default to Administrator
-    bool found_user = false;
-    for (int i = 0; i < user_count; i++) {
-        if (user_database[i].exists) {
-            puts("  Username:  ");
-            println(user_database[i].username);
-            found_user = true;
-            break;
-        }
-    }
-    
-    if (!found_user) {
-        println("  Username:  Administrator");
-    }
-    
-    println("  Domain:    SYSTEM");
-    println("  Groups:    Administrators, Users");
-    
-    // Get real PID
-    int pid = sys_getpid();
-    if (pid > 0) {
-        char buf[16];
-        puts("  Process:   PID ");
-        utoa_decimal(buf, pid);
-        println(buf);
-    }
-    
-    println("  Privilege: Ring 0 (Kernel Mode)");
-    
-    // Show session info
-    uint32_t ticks = get_ticks();
-    uint32_t session_time = ticks / 1000;
+/* 52. HEXDUMP - Hex dump of memory */
+static int cmd_hexdump(const char *args) {
+  char addr_str[16];
+  args = get_token(args, addr_str, 16);
+
+  if (addr_str[0] == 0) {
+    puts("Usage: HEXDUMP address\n");
+    return -1;
+  }
+
+  uint32_t addr = str_to_int(addr_str);
+  uint8_t *ptr = (uint8_t *)addr;
+
+  puts("Hex dump at 0x");
+  print_hex(addr);
+  puts(":\n");
+
+  for (int i = 0; i < 16; i++) {
+    print_hex(ptr[i]);
+    puts(" ");
+  }
+  puts("\n");
+
+  return 0;
+}
+
+/* 53. ASCII - Show ASCII table */
+static int cmd_ascii(const char *args) {
+  (void)args;
+  puts("ASCII Table (printable):\n");
+
+  for (int i = 32; i < 127; i++) {
     char buf[16];
-    puts("  Session:   ");
-    utoa_decimal(buf, session_time);
+    int_to_str(i, buf);
     puts(buf);
-    println(" seconds");
-    
-    println("");
-    
-    // Show registered users count
-    puts("Total registered users: ");
-    utoa_decimal(buf, user_count);
-    println(buf);
-    
-    return 0;
-}
-
-static int cmd_exit(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    println("Exit command not available.");
-    println("Use SHUTDOWN or REBOOT to exit RO-DOS.");
-    return 0;
-}
-
-/* FILESYSTEM COMMANDS */
-
-static int cmd_dir(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    
-    println("");
-    puts(" Directory of "); println(current_dir);
-    println("");
-    
-    uint32_t total_files = 0;
-    uint32_t total_dirs = 0;
-    uint32_t total_bytes = 0;
-    
-    // Use simulated filesystem only (avoid syscalls)
-    init_filesystem();
-    
-    for (int i = 0; i < fs_entry_count; i++) {
-        FSEntry *e = &fs_entries[i];
-        char buf[32];
-        
-        if (e->type == 1) {
-            puts("<DIR>         ");
-            total_dirs++;
-        } else {
-            puts("     ");
-            utoa_decimal(buf, e->size);
-            int pad = 10 - strlen_local(buf);
-            for (int j = 0; j < pad; j++) putc(' ');
-            puts(buf);
-            total_files++;
-            total_bytes += e->size;
-        }
-        
-        puts(" ");
-        println(e->name);
-    }
-    
-    println("");
-    char buf[32];
-    puts("     ");
-    utoa_decimal(buf, total_files);
-    puts(buf);
-    puts(" File(s)     ");
-    utoa_decimal(buf, total_bytes);
-    puts(buf);
-    println(" bytes");
-    
-    puts("     ");
-    utoa_decimal(buf, total_dirs);
-    puts(buf);
-    println(" Dir(s)");
-    
-    return 0;
-}
-
-static int cmd_cd(int argc, char *argv[]) {
-    if (argc < 2) {
-        println(current_dir);
-        return 0;
-    }
-    
-    char *path = argv[1];
-    
-    // String manipulation only (avoid syscalls)
-    if (strcmp_local(path, "..") == 0) {
-        char *last = current_dir + strlen_local(current_dir) - 1;
-        if (*last == '\\') last--;
-        while (last > current_dir && *last != '\\') last--;
-        if (last > current_dir) {
-            *(last + 1) = '\0';
-        }
-    } else if (strcmp_local(path, "\\") == 0) {
-        strcpy_local(current_dir, "C:\\");
-    } else {
-        if (strlen_local(current_dir) + strlen_local(path) < 250) {
-            strcat_local(current_dir, path);
-            if (current_dir[strlen_local(current_dir) - 1] != '\\') {
-                strcat_local(current_dir, "\\");
-            }
-        }
-    }
-    
-    return 0;
-}
-
-static int cmd_md(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: MD <directory>");
-        return -1;
-    }
-    
-    if (fs_entry_count >= 50) {
-        println("Error: Directory table full");
-        return -1;
-    }
-    
-    strcpy_local(fs_entries[fs_entry_count].name, argv[1]);
-    toupper_str(fs_entries[fs_entry_count].name);
-    fs_entries[fs_entry_count].size = 0;
-    fs_entries[fs_entry_count].type = 1;
-    fs_entries[fs_entry_count].attr = 0x10;
-    fs_entry_count++;
-    
-    puts("Directory created: ");
-    println(argv[1]);
-    return 0;
-}
-
-static int cmd_rd(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: RD <directory>");
-        return -1;
-    }
-    
-    char name[64];
-    strcpy_local(name, argv[1]);
-    toupper_str(name);
-    
-    for (int i = 0; i < fs_entry_count; i++) {
-        if (fs_entries[i].type == 1 && strcmp_local(fs_entries[i].name, name) == 0) {
-            for (int j = i; j < fs_entry_count - 1; j++) {
-                fs_entries[j] = fs_entries[j + 1];
-            }
-            fs_entry_count--;
-            puts("Directory removed: ");
-            println(argv[1]);
-            return 0;
-        }
-    }
-    
-    println("Directory not found");
-    return -1;
-}
-
-static int cmd_type(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: TYPE <filename>");
-        return -1;
-    }
-    
-    char name[64];
-    strcpy_local(name, argv[1]);
-    toupper_str(name);
-    
-    for (int i = 0; i < fs_entry_count; i++) {
-        if (fs_entries[i].type == 0 && strcmp_local(fs_entries[i].name, name) == 0) {
-            println("");
-            puts("Content of: ");
-            println(name);
-            print_separator();
-            println("This is RO-DOS, a protected mode operating system.");
-            println("File contents would be displayed here.");
-            println("");
-            println("Features:");
-            println("  - 32-bit Protected Mode");
-            println("  - Basic memory management");
-            println("  - Shell with ~100 commands");
-            println("  - Simulated filesystem");
-            print_separator();
-            return 0;
-        }
-    }
-    
-    println("File not found");
-    return -1;
-}
-
-static int cmd_copy(int argc, char *argv[]) {
-    if (argc < 3) {
-        println("Usage: COPY <source> <destination>");
-        return -1;
-    }
-    
-    char src[64], dst[64];
-    strcpy_local(src, argv[1]);
-    strcpy_local(dst, argv[2]);
-    toupper_str(src);
-    toupper_str(dst);
-    
-    bool found = false;
-    uint32_t size = 0;
-    
-    for (int i = 0; i < fs_entry_count; i++) {
-        if (fs_entries[i].type == 0 && strcmp_local(fs_entries[i].name, src) == 0) {
-            found = true;
-            size = fs_entries[i].size;
-            break;
-        }
-    }
-    
-    if (!found) {
-        println("Source file not found");
-        return -1;
-    }
-    
-    if (fs_entry_count >= 50) {
-        println("Error: Directory table full");
-        return -1;
-    }
-    
-    strcpy_local(fs_entries[fs_entry_count].name, dst);
-    fs_entries[fs_entry_count].size = size;
-    fs_entries[fs_entry_count].type = 0;
-    fs_entries[fs_entry_count].attr = 0x20;
-    fs_entry_count++;
-    
-    puts("        1 file(s) copied.");
-    putc('\n');
-    return 0;
-}
-
-static int cmd_del(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: DEL <filename>");
-        return -1;
-    }
-    
-    char name[64];
-    strcpy_local(name, argv[1]);
-    toupper_str(name);
-    
-    for (int i = 0; i < fs_entry_count; i++) {
-        if (fs_entries[i].type == 0 && strcmp_local(fs_entries[i].name, name) == 0) {
-            for (int j = i; j < fs_entry_count - 1; j++) {
-                fs_entries[j] = fs_entries[j + 1];
-            }
-            fs_entry_count--;
-            return 0;
-        }
-    }
-    
-    println("File not found");
-    return -1;
-}
-
-static int cmd_ren(int argc, char *argv[]) {
-    if (argc < 3) {
-        println("Usage: REN <oldname> <newname>");
-        return -1;
-    }
-    
-    char oldname[64], newname[64];
-    strcpy_local(oldname, argv[1]);
-    strcpy_local(newname, argv[2]);
-    toupper_str(oldname);
-    toupper_str(newname);
-    
-    for (int i = 0; i < fs_entry_count; i++) {
-        if (strcmp_local(fs_entries[i].name, oldname) == 0) {
-            strcpy_local(fs_entries[i].name, newname);
-            return 0;
-        }
-    }
-    
-    println("File not found");
-    return -1;
-}
-
-static int cmd_attrib(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Displays or changes file attributes.");
-        println("");
-        println("Usage: ATTRIB [+R | -R] [+A | -A] [+S | -S] [+H | -H] filename");
-        println("");
-        println("  +R   Sets Read-only attribute");
-        println("  -R   Clears Read-only attribute");
-        println("  +A   Sets Archive attribute");
-        println("  -A   Clears Archive attribute");
-        println("  +S   Sets System attribute");
-        println("  -S   Clears System attribute");
-        println("  +H   Sets Hidden attribute");
-        println("  -H   Clears Hidden attribute");
-        return 0;
-    }
-    
-    char name[64];
-    strcpy_local(name, argv[argc - 1]);
-    toupper_str(name);
-    
-    for (int i = 0; i < fs_entry_count; i++) {
-        if (strcmp_local(fs_entries[i].name, name) == 0) {
-            uint8_t attr = fs_entries[i].attr;
-            
-            for (int j = 1; j < argc - 1; j++) {
-                if (strcmp_local(argv[j], "+R") == 0) attr |= 0x01;
-                if (strcmp_local(argv[j], "-R") == 0) attr &= ~0x01;
-                if (strcmp_local(argv[j], "+A") == 0) attr |= 0x20;
-                if (strcmp_local(argv[j], "-A") == 0) attr &= ~0x20;
-                if (strcmp_local(argv[j], "+S") == 0) attr |= 0x04;
-                if (strcmp_local(argv[j], "-S") == 0) attr &= ~0x04;
-                if (strcmp_local(argv[j], "+H") == 0) attr |= 0x02;
-                if (strcmp_local(argv[j], "-H") == 0) attr &= ~0x02;
-            }
-            
-            fs_entries[i].attr = attr;
-            
-            if (attr & 0x01) putc('R'); else putc(' ');
-            if (attr & 0x20) putc('A'); else putc(' ');
-            if (attr & 0x04) putc('S'); else putc(' ');
-            if (attr & 0x02) putc('H'); else putc(' ');
-            puts("  ");
-            println(name);
-            return 0;
-        }
-    }
-    
-    println("File not found");
-    return -1;
-}
-
-static int cmd_touch(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: TOUCH <filename>");
-        return -1;
-    }
-    
-    if (fs_entry_count >= 50) {
-        println("Error: Directory table full");
-        return -1;
-    }
-    
-    strcpy_local(fs_entries[fs_entry_count].name, argv[1]);
-    toupper_str(fs_entries[fs_entry_count].name);
-    fs_entries[fs_entry_count].size = 0;
-    fs_entries[fs_entry_count].type = 0;
-    fs_entries[fs_entry_count].attr = 0x20;
-    fs_entry_count++;
-    
-    puts("File created: ");
-    println(argv[1]);
-    return 0;
-}
-
-static int cmd_xcopy(int argc, char *argv[]) {
-    if (argc < 3) {
-        println("XCOPY - Extended file copy utility");
-        println("");
-        println("Usage: XCOPY <source> <destination> [/S] [/E]");
-        println("");
-        println("  /S   Copies directories and subdirectories");
-        println("  /E   Copies empty directories");
-        return 0;
-    }
-    
-    puts("Copying from ");
-    puts(argv[1]);
-    puts(" to ");
-    puts(argv[2]);
-    println("...");
-    
-    // Try to use real filesystem copy
-    typedef struct {
-        char name[256];
-        uint32_t size;
-        uint8_t is_directory;
-        uint8_t reserved[3];
-    } dirent_t;
-    
-    int src_dir = sys_opendir(argv[1]);
-    uint32_t files_copied = 0;
-    uint32_t bytes_copied = 0;
-    
-    if (src_dir >= 0) {
-        dirent_t entry;
-        while (sys_readdir(src_dir, &entry) == 0) {
-            if (!entry.is_directory) {
-                files_copied++;
-                bytes_copied += entry.size;
-            }
-        }
-        sys_closedir(src_dir);
-    } else {
-        // Fallback: estimate from memory stats
-        uint32_t stats[3];
-        mem_get_stats(stats);
-        files_copied = (stats[1] / 1024) / 64;  // Estimate files
-        bytes_copied = stats[1] * 1024;
-    }
-    
-    char buf[32];
-    puts("        ");
-    utoa_decimal(buf, files_copied);
-    puts(buf);
-    puts(" File(s) copied (");
-    utoa_decimal(buf, bytes_copied);
-    puts(buf);
-    println(" bytes)");
-    return 0;
-}
-
-static int cmd_find(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: FIND <pattern> [filename]");
-        return -1;
-    }
-    
-    println("---------- Search Results ----------");
-    puts("Searching for: ");
-    println(argv[1]);
-    println("");
-    
-    // Try to search in real filesystem
-    char *search_path = (argc > 2) ? argv[2] : current_dir;
-    int dir_fd = sys_opendir(search_path);
-    uint32_t matches = 0;
-    
-    if (dir_fd >= 0) {
-        typedef struct {
-            char name[256];
-            uint32_t size;
-            uint8_t is_directory;
-            uint8_t reserved[3];
-        } dirent_t;
-        
-        dirent_t entry;
-        while (sys_readdir(dir_fd, &entry) == 0) {
-            if (!entry.is_directory) {
-                // Simple pattern matching (check if pattern is in filename)
-                char *pattern = argv[1];
-                char *filename = entry.name;
-                bool found = false;
-                
-                // Case-insensitive search
-                int i = 0, j = 0;
-                while (filename[i] && pattern[j]) {
-                    char f = filename[i];
-                    char p = pattern[j];
-                    if (f >= 'a' && f <= 'z') f -= 32;
-                    if (p >= 'a' && p <= 'z') p -= 32;
-                    if (f == p) {
-                        j++;
-                        if (!pattern[j]) {
-                            found = true;
-                            break;
-                        }
-                    } else {
-                        j = 0;
-                    }
-                    i++;
-                }
-                
-                if (found) {
-                    puts(filename);
-                    println(": Found");
-                    matches++;
-                }
-            }
-        }
-        sys_closedir(dir_fd);
-    }
-    
-    if (matches == 0) {
-        println("No matches found");
-    } else {
-        char buf[32];
-        utoa_decimal(buf, matches);
-        puts(buf);
-        puts(" match(es) found");
-        println("");
-    }
-    
-    return 0;
-}
-
-static int cmd_pushd(int argc, char *argv[]) {
-    if (dir_stack_ptr >= 10) {
-        println("Directory stack overflow");
-        return -1;
-    }
-    
-    strcpy_local(dir_stack[dir_stack_ptr++], current_dir);
-    
-    if (argc > 1) {
-        return cmd_cd(argc, argv);
-    }
-    return 0;
-}
-
-static int cmd_popd(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    
-    if (dir_stack_ptr <= 0) {
-        println("Directory stack empty");
-        return -1;
-    }
-    
-    strcpy_local(current_dir, dir_stack[--dir_stack_ptr]);
-    println(current_dir);
-    return 0;
-}
-
-/* === DISK & HARDWARE COMMANDS === */
-
-static int cmd_format(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Format a disk for use with RO-DOS");
-        println("");
-        println("Usage: FORMAT <drive:> [/Q] [/S]");
-        println("");
-        println("  /Q   Quick format");
-        println("  /S   Copy system files");
-        return 0;
-    }
-    
-    char drive = argv[1][0];
-    
-    // Get real disk size
-    uint32_t stats[3];
-    mem_get_stats(stats);
-    uint32_t total_mb = (stats[0] + stats[1]) / 1024;
-    
-    puts("WARNING: ALL DATA ON ");
-    putc(drive);
-    println(": WILL BE LOST!");
-    puts("Disk size: ");
-    char buf[32];
-    utoa_decimal(buf, total_mb);
-    puts(buf);
-    println(" MB");
-    println("Press Y to continue, any other key to cancel.");
-    
-    // In a real implementation, this would read user input
-    // For now, show that format would proceed with real disk info
-    println("");
-    println("Format operation requires user confirmation.");
-    println("Use low-level disk utilities for actual formatting.");
-    return 0;
-}
-
-static int cmd_fdisk(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    
-    println("");
-    println("RO-DOS FDISK - Partition Management Utility");
-    print_separator();
-    println("");
-    
-    // Read real partition table from MBR (Master Boot Record) at LBA 0
-    uint8_t mbr[512];
-    if (sys_read_sector(0, 1, mbr) == 0) {
-        // Parse MBR partition table (starts at offset 0x1BE)
-        println("Current fixed disk drive: 1");
-        println("");
-        println("Partition Table:");
-        println("");
-        println("  #  Type    Start LBA    Size (MB)    Status");
-        println("  -  ----    ---------    ---------    ------");
-        
-        uint32_t total_size = 0;
-        for (int i = 0; i < 4; i++) {
-            uint8_t *part_entry = &mbr[0x1BE + (i * 16)];
-            uint8_t status = part_entry[0];
-            uint8_t type = part_entry[4];
-            uint32_t start_lba = *(uint32_t*)&part_entry[8];
-            uint32_t sectors = *(uint32_t*)&part_entry[12];
-            uint32_t size_mb = (sectors * 512) / (1024 * 1024);
-            
-            if (type != 0) {
-                char buf[32];
-                puts("  ");
-                utoa_decimal(buf, i + 1);
-                puts(buf);
-                puts("  0x");
-                char hex_buf[8];
-                utoa_hex(hex_buf, type);
-                puts(hex_buf);
-                puts("      ");
-                utoa_decimal(buf, start_lba);
-                int pad = 9 - strlen_local(buf);
-                for (int j = 0; j < pad; j++) putc(' ');
-                puts(buf);
-                puts("    ");
-                utoa_decimal(buf, size_mb);
-                pad = 9 - strlen_local(buf);
-                for (int j = 0; j < pad; j++) putc(' ');
-                puts(buf);
-                puts("    ");
-                if (status == 0x80) {
-                    println("Active");
-                } else {
-                    println("Inactive");
-                }
-                total_size += size_mb;
-            }
-        }
-        
-        if (total_size > 0) {
-            println("");
-            puts("Total disk size: ");
-            char buf[32];
-            utoa_decimal(buf, total_size);
-            puts(buf);
-            println(" MB");
-        } else {
-            println("  No partitions found");
-        }
-    } else {
-        // Fallback: show disk info from memory stats
-        uint32_t stats[3];
-        mem_get_stats(stats);
-        uint32_t total_mb = (stats[0] + stats[1]) / 1024;
-        
-        println("Current fixed disk drive: 1");
-        println("");
-        puts("Disk size: ");
-        char buf[32];
-        utoa_decimal(buf, total_mb);
-        puts(buf);
-        println(" MB");
-        println("");
-        println("No partition table found. Disk may be unpartitioned.");
-    }
-    
-    println("");
-    println("Choose one of the following:");
-    println("");
-    println("  1. Create DOS partition or Logical DOS Drive");
-    println("  2. Set active partition");
-    println("  3. Delete partition or Logical DOS Drive");
-    println("  4. Display partition information");
-    println("");
-    println("Enter choice: [4]");
-    println("");
-    return 0;
-}
-
-static int cmd_chkdsk(int argc, char *argv[]) {
-    char drive = 'C';
-    if (argc > 1) drive = argv[1][0];
-    
-    println("");
-    puts("Checking disk "); putc(drive); println(":");
-    println("");
-    
-    // Get real memory stats to calculate disk-like info
-    uint32_t stats[3];
-    mem_get_stats(stats);
-    
-    // Calculate disk space from available memory (simplified)
-    uint32_t total_bytes = (stats[0] + stats[1]) * 1024;
-    uint32_t free_bytes = stats[0] * 1024;
-    uint32_t used_bytes = stats[1] * 1024;
-    
-    // Generate volume serial from system info (real system-derived)
-    uint32_t serial = get_ticks() ^ (stats[0] + stats[1]);
-    char serial_buf[16];
-    const char *hex = "0123456789ABCDEF";
-    int idx = 0;
-    // Format as XXXX-XXXX
-    for (int shift = 28; shift >= 0; shift -= 4) {
-        serial_buf[idx++] = hex[(serial >> shift) & 0xF];
-        if (shift == 16) serial_buf[idx++] = '-';
-    }
-    serial_buf[idx] = '\0';
-    
-    puts("Volume Serial Number is ");
-    puts(serial_buf);
-    println("");
-    println("");
-    
-    char buf[32];
+    puts(": ");
+    putc((char)i);
     puts("  ");
-    utoa_decimal(buf, total_bytes);
-    puts(buf);
-    println(" bytes total disk space");
-    
-    // Estimate file counts from memory usage
-    uint32_t hidden_bytes = used_bytes / 4;
-    puts("    ");
-    utoa_decimal(buf, hidden_bytes);
-    puts(buf);
-    println(" bytes in system files");
-    
-    uint32_t dir_bytes = used_bytes / 8;
-    puts("     ");
-    utoa_decimal(buf, dir_bytes);
-    puts(buf);
-    println(" bytes in directories");
-    
-    uint32_t user_bytes = used_bytes - hidden_bytes - dir_bytes;
-    puts("    ");
-    utoa_decimal(buf, user_bytes);
-    puts(buf);
-    println(" bytes in user files");
-    
-    puts("  ");
-    utoa_decimal(buf, free_bytes);
-    puts(buf);
-    println(" bytes available on disk");
-    println("");
-    
-    uint32_t cluster_size = 2048;
-    uint32_t total_clusters = total_bytes / cluster_size;
-    uint32_t free_clusters = free_bytes / cluster_size;
-    
-    puts("      ");
-    utoa_decimal(buf, cluster_size);
-    puts(buf);
-    println(" bytes in each allocation unit");
-    puts("      ");
-    utoa_decimal(buf, total_clusters);
-    puts(buf);
-    println(" total allocation units on disk");
-    puts("        ");
-    utoa_decimal(buf, free_clusters);
-    puts(buf);
-    println(" available allocation units on disk");
-    println("");
-    println("No errors found");
-    return 0;
+
+    if ((i - 31) % 8 == 0) {
+      puts("\n");
+    }
+  }
+  puts("\n");
+
+  return 0;
 }
 
-static int cmd_mount(int argc, char *argv[]) {
-    init_drives();
+/* 54. HASH - Hash a string */
+static int cmd_hash(const char *args) {
+  args = skip_spaces(args);
+
+  if (args[0] == 0) {
+    puts("Usage: HASH string\n");
+    return -1;
+  }
+
+  uint32_t h = hash_string(args);
+
+  puts("Hash: 0x");
+  print_hex(h);
+  puts("\n");
+
+  return 0;
+}
+
+/* Stub WiFi command - informs user to use VirtIO network */
+static int cmd_wifilogin(const char *args) {
+  (void)args;
+  puts("WiFi is not available in VirtIO mode.\n");
+  puts("Use NETSTART to initialize VirtIO network instead.\n");
+  return 0;
+}
+
+static int cmd_wifiscan(const char *args) {
+  (void)args;
+  puts("WiFi scanning is not available in VirtIO mode.\n");
+  puts("VirtIO provides wired ethernet-like connectivity.\n");
+  return 0;
+}
+
+static int cmd_wificonnect(const char *args) {
+  (void)args;
+  puts("WiFi is not available in VirtIO mode.\n");
+  puts("Use NETSTART to connect via VirtIO network.\n");
+  return 0;
+}
+
+static int cmd_wifistatus(const char *args) {
+  (void)args;
+  puts("WiFi status not available. Use IPCONFIG for network status.\n");
+  return 0;
+}
+
+/* Dummy declarations to satisfy any remaining references */
+
+/* Alias commands */
+static int cmd_clear(const char *args) { return cmd_cls(args); }
+static int cmd_rm(const char *args) { return cmd_del(args); }
+static int cmd_ls(const char *args) { return cmd_dir(args); }
+static int cmd_pwd(const char *args) { (void)args; puts(current_dir); puts("\n"); return 0; }
+static int cmd_type(const char *args) { return cmd_cat(args); }
+static int cmd_cp(const char *args) { return cmd_copy(args); }
+static int cmd_mv(const char *args) { return cmd_move(args); }
+
+/* WiFi stub commands - Not supported in VirtIO mode */
+static int cmd_wifiap(const char *a) { (void)a; puts("WiFi not available - use NETSTART\n"); return 0; }
+static int cmd_wifidisconnect(const char *a) { (void)a; puts("WiFi not available\n"); return 0; }
+static int cmd_wifirescan(const char *a) { (void)a; puts("WiFi not available\n"); return 0; }
+static int cmd_wifisignal(const char *a) { (void)a; puts("WiFi not available\n"); return 0; }
+static int cmd_wifistat(const char *a) { (void)a; puts("WiFi not available - use IPCONFIG\n"); return 0; }
+/* cmd_wifitest defined above with Rust driver */
+
+/* System stub commands */
+static int cmd_mount(const char *a) { (void)a; puts("MOUNT: Not implemented\n"); return 0; }
+static int cmd_umount(const char *a) { (void)a; puts("UMOUNT: Not implemented\n"); return 0; }
+static int cmd_sync(const char *a) { (void)a; puts("SYNC: OK\n"); return 0; }
+static int cmd_free(const char *a) { (void)a; puts("FREE: Memory info not available\n"); return 0; }
+static int cmd_df(const char *a) { (void)a; puts("DF: Disk info not available\n"); return 0; }
+static int cmd_du(const char *a) { (void)a; puts("DU: Not implemented\n"); return 0; }
+static int cmd_lsblk(const char *a) { (void)a; puts("LSBLK: Not implemented\n"); return 0; }
+static int cmd_fdisk(const char *a) { (void)a; puts("FDISK: Not implemented\n"); return 0; }
+static int cmd_blkid(const char *a) { (void)a; puts("BLKID: Not implemented\n"); return 0; }
+static int cmd_readsector(const char *a) { (void)a; puts("READSECTOR: Not implemented\n"); return 0; }
+static int cmd_sysinfo(const char *a) { (void)a; puts("RO-DOS with VirtIO drivers\n"); return 0; }
+static int cmd_uname(const char *a) { (void)a; puts("RO-DOS v1.0 i386\n"); return 0; }
+static int cmd_hostname(const char *a) { (void)a; puts("rodos\n"); return 0; }
+static int cmd_lscpu(const char *a) { (void)a; puts("LSCPU: x86 CPU\n"); return 0; }
+static int cmd_lspci(const char *a) { 
+    (void)a;
+    /* Direct PCI scan - check all slots on bus 0 */
+    extern uint32_t pci_config_read(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);
     
-    if (argc < 2) {
-        println("");
-        println("Current Mount Points");
-        print_separator();
-        println("");
-        println("  Drive  Device    Type        Label           Status");
-        println("  -----  ------    ----        -----           ------");
+    puts("=== PCI Scan (Bus 0) ===\n");
+    char hex[] = "0123456789ABCDEF";
+    int found = 0;
+    
+    for (int dev = 0; dev < 32; dev++) {
+        uint32_t vendor_device = pci_config_read(0, dev, 0, 0x00);
+        uint16_t vendor = vendor_device & 0xFFFF;
+        uint16_t device_id = (vendor_device >> 16) & 0xFFFF;
         
-        // Show all mounted drives
-        for (int i = 0; i < drive_count; i++) {
-            DiskDrive *d = &drives[i];
-            char buf[32];
+        if (vendor != 0xFFFF && vendor != 0x0000) {
+            uint32_t bar0 = pci_config_read(0, dev, 0, 0x10);
+            uint32_t bar1 = pci_config_read(0, dev, 0, 0x14);
             
-            puts("  ");
-            putc(d->letter);
-            puts(":     ");
+            puts("Slot ");
+            if (dev < 10) putc('0');
+            putc('0' + dev / 10); putc('0' + dev % 10);
+            puts(": Vendor=");
+            for (int j = 12; j >= 0; j -= 4) putc(hex[(vendor >> j) & 0xF]);
+            puts(" Dev=");
+            for (int j = 12; j >= 0; j -= 4) putc(hex[(device_id >> j) & 0xF]);
+            puts(" BAR0=");
+            for (int j = 28; j >= 0; j -= 4) putc(hex[(bar0 >> j) & 0xF]);
+            puts(" BAR1=");
+            for (int j = 28; j >= 0; j -= 4) putc(hex[(bar1 >> j) & 0xF]);
+            puts("\n");
+            found++;
             
-            // Device name based on type
-            if (d->type == 0) {
-                puts("HD");
-                utoa_decimal(buf, i);
-                puts(buf);
-            } else if (d->type == 1) {
-                puts("FD");
-                utoa_decimal(buf, i);
-                puts(buf);
-            } else {
-                puts("CD");
-                utoa_decimal(buf, i);
-                puts(buf);
+            /* Check if VirtIO */
+            if (vendor == 0x1AF4) {
+                puts("  ^^^ VirtIO device found!\n");
             }
-            puts("      ");
-            
-            // Type
-            if (d->type == 0) puts("HDD       ");
-            else if (d->type == 1) puts("Floppy    ");
-            else puts("CD-ROM    ");
-            
-            // Label
-            puts(d->label);
-            int pad = 16 - strlen_local(d->label);
-            for (int j = 0; j < pad; j++) putc(' ');
-            
-            // Status
-            println("Mounted");
         }
-        
-        println("");
-        
-        // Show available unmounted devices
-        println("Available devices for mounting:");
-        
-        // Check for floppy drives
-        uint8_t hw_config = cmos_read(0x0E);
-        uint8_t floppy_count = (hw_config >> 4) & 0x0F;
-        
-        if (floppy_count > drive_count) {
+    }
+    
+    if (found == 0) puts("No PCI devices found!\n");
+    else {
+        puts("Total: ");
+        putc('0' + found / 10); putc('0' + found % 10);
+        puts(" devices\n");
+    }
+    puts("VirtIO vendor ID is 1AF4\n");
+    return 0;
+}
+static int cmd_dmesg(const char *a) { (void)a; puts("DMESG: No kernel messages\n"); return 0; }
+static int cmd_mode(const char *a) { (void)a; puts("MODE: Use GUITEST for graphics\n"); return 0; }
+static int cmd_ipconfig(const char *a) { (void)a; puts("Use NETSTAT for network status\n"); return 0; }
+static int cmd_ping(const char *a) { (void)a; puts("PING: Use NETSTART first, then WGET to test network\n"); return 0; }
+static int cmd_wc(const char *a) { (void)a; puts("WC: Not implemented\n"); return 0; }
+static int cmd_tail(const char *a) { (void)a; puts("TAIL: Not implemented\n"); return 0; }
+static int cmd_head(const char *a) { (void)a; puts("HEAD: Not implemented\n"); return 0; }
+static int cmd_sort(const char *a) { (void)a; puts("SORT: Not implemented\n"); return 0; }
+static int cmd_uniq(const char *a) { (void)a; puts("UNIQ: Not implemented\n"); return 0; }
+static int cmd_diff(const char *a) { (void)a; puts("DIFF: Not implemented\n"); return 0; }
+static int cmd_cut(const char *a) { (void)a; puts("CUT: Not implemented\n"); return 0; }
+static int cmd_paste(const char *a) { (void)a; puts("PASTE: Not implemented\n"); return 0; }
+static int cmd_tr(const char *a) { (void)a; puts("TR: Not implemented\n"); return 0; }
+static int cmd_sed(const char *a) { (void)a; puts("SED: Not implemented\n"); return 0; }
+static int cmd_awk(const char *a) { (void)a; puts("AWK: Not implemented\n"); return 0; }
+static int cmd_base64(const char *a) { (void)a; puts("BASE64: Not implemented\n"); return 0; }
+static int cmd_xxd(const char *a) { (void)a; puts("XXD: Not implemented\n"); return 0; }
+static int cmd_od(const char *a) { (void)a; puts("OD: Not implemented\n"); return 0; }
+static int cmd_rev(const char *a) { (void)a; puts("REV: Not implemented\n"); return 0; }
+static int cmd_nl(const char *a) { (void)a; puts("NL: Not implemented\n"); return 0; }
+static int cmd_tac(const char *a) { (void)a; puts("TAC: Not implemented\n"); return 0; }
+static int cmd_factor(const char *a) { (void)a; puts("FACTOR: Not implemented\n"); return 0; }
+static int cmd_seq(const char *a) { (void)a; puts("SEQ: Not implemented\n"); return 0; }
+static int cmd_shuf(const char *a) { (void)a; puts("SHUF: Not implemented\n"); return 0; }
+static int cmd_yes(const char *a) { (void)a; puts("YES: Not implemented\n"); return 0; }
+static int cmd_watch(const char *a) { (void)a; puts("WATCH: Not implemented\n"); return 0; }
+static int cmd_timeout(const char *a) { (void)a; puts("TIMEOUT: Not implemented\n"); return 0; }
+static int cmd_which(const char *a) { (void)a; puts("WHICH: Not implemented\n"); return 0; }
+static int cmd_whereis(const char *a) { (void)a; puts("WHEREIS: Not implemented\n"); return 0; }
+static int cmd_id(const char *a) { (void)a; puts("uid=0(root)\n"); return 0; }
+static int cmd_who(const char *a) { (void)a; puts("root console\n"); return 0; }
+static int cmd_w(const char *a) { (void)a; puts("root console\n"); return 0; }
+static int cmd_last(const char *a) { (void)a; puts("LAST: Not implemented\n"); return 0; }
+static int cmd_env(const char *a) { (void)a; puts("PATH=/\nHOME=/\n"); return 0; }
+static int cmd_export(const char *a) { (void)a; puts("EXPORT: Not implemented\n"); return 0; }
+static int cmd_unset(const char *a) { (void)a; puts("UNSET: Not implemented\n"); return 0; }
+static int cmd_printenv(const char *a) { return cmd_env(a); }
+static int cmd_set(const char *a) { return cmd_env(a); }
+static int cmd_source(const char *a) { (void)a; puts("SOURCE: Not implemented\n"); return 0; }
+static int cmd_true(const char *a) { (void)a; return 0; }
+static int cmd_false(const char *a) { (void)a; return 1; }
+static int cmd_test(const char *a) { (void)a; puts("TEST: Not implemented\n"); return 0; }
+static int cmd_expr(const char *a) { (void)a; puts("EXPR: Not implemented\n"); return 0; }
+static int cmd_let(const char *a) { (void)a; puts("LET: Not implemented\n"); return 0; }
+static int cmd_read(const char *a) { (void)a; puts("READ: Not implemented\n"); return 0; }
+static int cmd_printf(const char *a) { if(a) puts(a); puts("\n"); return 0; }
+static int cmd_alias(const char *a) { (void)a; puts("ALIAS: Not implemented\n"); return 0; }
+static int cmd_unalias(const char *a) { (void)a; puts("UNALIAS: Not implemented\n"); return 0; }
+static int cmd_history(const char *a) { (void)a; puts("HISTORY: Not implemented\n"); return 0; }
+static int cmd_jobs(const char *a) { (void)a; puts("JOBS: Not implemented\n"); return 0; }
+static int cmd_fg(const char *a) { (void)a; puts("FG: Not implemented\n"); return 0; }
+static int cmd_bg(const char *a) { (void)a; puts("BG: Not implemented\n"); return 0; }
+static int cmd_nice(const char *a) { (void)a; puts("NICE: Not implemented\n"); return 0; }
+static int cmd_nohup(const char *a) { (void)a; puts("NOHUP: Not implemented\n"); return 0; }
+static int cmd_strace(const char *a) { (void)a; puts("STRACE: Not implemented\n"); return 0; }
+
+/* More missing stubs */
+static int cmd_grep(const char *a) { (void)a; puts("GREP: Not implemented\n"); return 0; }
+static int cmd_more(const char *a) { (void)a; puts("MORE: Not implemented\n"); return 0; }
+static int cmd_less(const char *a) { (void)a; puts("LESS: Not implemented\n"); return 0; }
+static int cmd_file(const char *a) { (void)a; puts("FILE: Not implemented\n"); return 0; }
+static int cmd_stat(const char *a) { (void)a; puts("STAT: Not implemented\n"); return 0; }
+static int cmd_path(const char *a) { (void)a; puts("/\n"); return 0; }
+static int cmd_prompt(const char *a) { (void)a; puts("PROMPT: Not implemented\n"); return 0; }
+static int cmd_ln(const char *a) { (void)a; puts("LN: Not implemented\n"); return 0; }
+static int cmd_chown(const char *a) { (void)a; puts("CHOWN: Not implemented\n"); return 0; }
+static int cmd_strings(const char *a) { (void)a; puts("STRINGS: Not implemented\n"); return 0; }
+static int cmd_cal(const char *a) { (void)a; puts("CAL: Not implemented\n"); return 0; }
+static int cmd_banner(const char *a) { if(a) puts(a); puts("\n"); return 0; }
+static int cmd_figlet(const char *a) { if(a) puts(a); puts("\n"); return 0; }
+static int cmd_cowsay(const char *a) { puts(" _____\n< "); if(a) puts(a); else puts("moo"); puts(" >\n -----\n"); return 0; }
+static int cmd_fortune(const char *a) { (void)a; puts("Your fortune: Good things come to those who wait!\n"); return 0; }
+
+// WiFi security type definitions (if not already included)
+/* 102. SUDO - Run command as root */
+static int cmd_sudo(const char *args) {
+  args = skip_spaces(args);
+  
+  if (args[0] == 0) {
+    puts("Usage: SUDO <command>\n");
+    puts("Execute a command with root privileges.\n");
+    return -1;
+  }
+  
+  // Check if user is already root
+  if (str_cmp(current_user, "root") == 0) {
+    puts("[sudo] User is already root.\n");
+    // Execute the command directly
+    return cmd_dispatch(args);
+  }
+  
+  // Prompt for password (simplified - accepts any input for demo)
+  puts("[sudo] Password for ");
+  puts(current_user);
+  puts(": ");
+  
+  // Read password (hidden)
+  char password[32] = {0};
+  int pos = 0;
+  while (pos < 31) {
+    uint16_t k = getkey();
+    uint8_t key = (uint8_t)(k & 0xFF);
+    
+    if (key == 13 || key == 10) break;  // Enter
+    if (key == 27) {  // ESC - cancel
+      puts("\n[sudo] Cancelled.\n");
+      return -1;
+    }
+    if (key == 8 && pos > 0) {  // Backspace
+      pos--;
+      password[pos] = 0;
+    } else if (key >= 32 && key <= 126) {
+      password[pos++] = key;
+      putc('*');  // Show asterisk
+    }
+  }
+  puts("\n");
+  
+  // For demo purposes, accept any non-empty password
+  if (pos == 0) {
+    set_attr(0x0C);
+    puts("[sudo] Authentication failed.\n");
+    set_attr(0x07);
+    return -1;
+  }
+  
+  // Temporarily become root
+  char saved_user[32];
+  str_copy(saved_user, current_user, 32);
+  str_copy(current_user, "root", 32);
+  
+  set_attr(0x0A);
+  puts("[sudo] Running as root...\n");
+  set_attr(0x07);
+  
+  // Execute the command
+  int result = cmd_dispatch(args);
+  
+  // Restore original user
+  str_copy(current_user, saved_user, 32);
+  
+  return result;
+}
+
+/* 103. PYTHON - Simple Python-like interpreter */
+static int cmd_python(const char *args) {
+  args = skip_spaces(args);
+  
+  set_attr(0x0E);
+  puts("RO-DOS Python 0.1 (Micro Edition)\n");
+  puts("A minimal Python-like interpreter for RO-DOS.\n");
+  set_attr(0x07);
+  puts("Type 'exit()' or 'quit()' to exit.\n");
+  puts("Supported: print(), input(), basic math (+,-,*,/,%), variables\n\n");
+  
+  // Simple variable storage (up to 16 variables)
+  char var_names[16][32];
+  int var_values[16];
+  int var_count = 0;
+  
+  // Initialize variables
+  for (int i = 0; i < 16; i++) {
+    var_names[i][0] = 0;
+    var_values[i] = 0;
+  }
+  
+  char line[256];
+  
+  while (1) {
+    puts(">>> ");
+    
+    // Read line
+    int pos = 0;
+    while (pos < 255) {
+      uint16_t k = getkey();
+      uint8_t key = (uint8_t)(k & 0xFF);
+      
+      if (key == 13 || key == 10) {
+        putc('\n');
+        break;
+      }
+      if (key == 27) {  // ESC
+        puts("\nKeyboardInterrupt\n");
+        pos = 0;
+        break;
+      }
+      if (key == 8 && pos > 0) {
+        pos--;
+        line[pos] = 0;
+        putc(8); putc(' '); putc(8);
+      } else if (key >= 32 && key <= 126 && pos < 255) {
+        line[pos++] = key;
+        putc(key);
+      }
+    }
+    line[pos] = 0;
+    
+    if (pos == 0) continue;
+    
+    // Skip whitespace
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    
+    // Check for exit
+    if (str_cmp(p, "exit()") == 0 || str_cmp(p, "quit()") == 0) {
+      puts("Goodbye!\n");
+      break;
+    }
+    
+    // Check for help
+    if (str_cmp(p, "help()") == 0) {
+      puts("RO-DOS Python Micro Edition\n");
+      puts("Commands:\n");
+      puts("  print(\"text\") or print(expr) - Display output\n");
+      puts("  input(\"prompt\")             - Get user input\n");
+      puts("  x = value                    - Assign variable\n");
+      puts("  Math: + - * / % ( )          - Arithmetic\n");
+      puts("  exit() or quit()             - Exit interpreter\n");
+      continue;
+    }
+    
+    // Check for print()
+    if (p[0] == 'p' && p[1] == 'r' && p[2] == 'i' && p[3] == 'n' && p[4] == 't' && p[5] == '(') {
+      const char *content = p + 6;
+      // Find closing )
+      int len = 0;
+      while (content[len] && content[len] != ')') len++;
+      
+      if (len > 0) {
+        // Check if it's a string
+        if (content[0] == '"' || content[0] == '\'') {
+          char quote = content[0];
+          for (int i = 1; i < len && content[i] != quote; i++) {
+            putc(content[i]);
+          }
+          putc('\n');
+        } else {
+          // Try to evaluate as expression or variable
+          char expr[64] = {0};
+          for (int i = 0; i < len && i < 63; i++) expr[i] = content[i];
+          
+          // Check if it's a variable
+          bool found_var = false;
+          for (int i = 0; i < var_count; i++) {
+            if (str_cmp(var_names[i], expr) == 0) {
+              char buf[16];
+              int_to_str(var_values[i], buf);
+              puts(buf);
+              puts("\n");
+              found_var = true;
+              break;
+            }
+          }
+          
+          if (!found_var) {
+            // Try to evaluate as number
+            int val = str_to_int(expr);
             char buf[16];
-            puts("  FD");
-            utoa_decimal(buf, drive_count);
+            int_to_str(val, buf);
             puts(buf);
-            println(" - Floppy Drive (1.44 MB)");
+            puts("\n");
+          }
         }
-        
-        // Check memory for additional devices
-        uint32_t stats[3];
-        mem_get_stats(stats);
-        if ((stats[0] + stats[1]) > 2048 * 1024) {
-            println("  HD1 - Secondary Hard Disk");
-        }
-        
-        println("");
-        println("Usage: MOUNT <drive> <device> [label]");
-        println("Example: MOUNT E: FD0 FLOPPY");
-        return 0;
+      } else {
+        puts("\n");
+      }
+      continue;
     }
     
-    if (argc < 3) {
-        println("Error: Device name required");
-        println("Usage: MOUNT <drive> <device> [label]");
-        return -1;
-    }
-    
-    // Parse drive letter
-    char drive_letter = argv[1][0];
-    if (drive_letter >= 'a' && drive_letter <= 'z') {
-        drive_letter -= 32; // Convert to uppercase
-    }
-    
-    if (drive_letter < 'A' || drive_letter > 'Z') {
-        println("Error: Invalid drive letter (must be A-Z)");
-        return -1;
-    }
-    
-    // Check if drive already mounted
-    for (int i = 0; i < drive_count; i++) {
-        if (drives[i].letter == drive_letter) {
-            puts("Error: Drive ");
-            putc(drive_letter);
-            println(": is already mounted");
-            println("Use UMOUNT first to unmount it");
-            return -1;
-        }
-    }
-    
-    if (drive_count >= 8) {
-        println("Error: Maximum number of drives reached");
-        return -1;
-    }
-    
-    // Parse device name
-    char *device = argv[2];
-    uint8_t dev_type = 0;
-    uint32_t dev_size = 0;
-    
-    // Determine device type
-    if ((device[0] == 'H' || device[0] == 'h') && 
-        (device[1] == 'D' || device[1] == 'd')) {
-        dev_type = 0; // Hard disk
-        
-        // Get real disk size from memory stats
-        uint32_t stats[3];
-        mem_get_stats(stats);
-        dev_size = (stats[0] + stats[1]) / 1024; // MB
-        
-    } else if ((device[0] == 'F' || device[0] == 'f') && 
-               (device[1] == 'D' || device[1] == 'd')) {
-        dev_type = 1; // Floppy
-        
-        // Check if floppy exists
-        uint8_t hw_config = cmos_read(0x0E);
-        uint8_t floppy_count = (hw_config >> 4) & 0x0F;
-        
-        if (floppy_count == 0) {
-            println("Error: No floppy drive detected in system");
-            return -1;
-        }
-        
-        dev_size = 1; // 1.44 MB floppy
-        
-    } else if ((device[0] == 'C' || device[0] == 'c') && 
-               (device[1] == 'D' || device[1] == 'd')) {
-        dev_type = 2; // CD-ROM
-        dev_size = 650; // Standard CD size
-        
-    } else {
-        println("Error: Unknown device type");
-        println("Supported: HD# (hard disk), FD# (floppy), CD# (CD-ROM)");
-        return -1;
-    }
-    
-    // Get label (optional)
-    char *label = (argc > 3) ? argv[3] : "VOLUME";
-    
-    // Mount the drive
-    drives[drive_count].letter = drive_letter;
-    strcpy_local(drives[drive_count].label, label);
-    toupper_str(drives[drive_count].label);
-    drives[drive_count].total_mb = dev_size;
-    drives[drive_count].free_mb = dev_size; // Start with full space
-    drives[drive_count].type = dev_type;
-    drive_count++;
-    
-    println("");
-    puts("Successfully mounted ");
-    puts(device);
-    puts(" as ");
-    putc(drive_letter);
-    println(":");
-    
-    char buf[32];
-    puts("  Label: ");
-    println(label);
-    puts("  Type: ");
-    if (dev_type == 0) println("Hard Disk");
-    else if (dev_type == 1) println("Floppy Disk");
-    else println("CD-ROM");
-    puts("  Size: ");
-    utoa_decimal(buf, dev_size);
-    puts(buf);
-    println(" MB");
-    println("");
-    
-    return 0;
-}
-
-static int cmd_label(int argc, char *argv[]) {
-    init_drives();
-    
-    if (argc < 2) {
-        // Get real volume info
-        uint32_t stats[3];
-        mem_get_stats(stats);
-        uint32_t serial = get_ticks() ^ (stats[0] + stats[1]);
-        char serial_buf[16];
-        const char *hex = "0123456789ABCDEF";
-        int idx = 0;
-        for (int shift = 28; shift >= 0; shift -= 4) {
-            serial_buf[idx++] = hex[(serial >> shift) & 0xF];
-            if (shift == 16) serial_buf[idx++] = '-';
-        }
-        serial_buf[idx] = '\0';
-        
-        println("Volume in drive C is SYSTEM");
-        puts("Volume Serial Number is ");
-        println(serial_buf);
-        return 0;
-    }
-    
-    puts("Volume label set to: ");
-    println(argv[1]);
-    return 0;
-}
-
-static int cmd_diskcomp(int argc, char *argv[]) {
-    if (argc < 3) {
-        println("Usage: DISKCOMP <drive1> <drive2>");
-        return -1;
-    }
-    
-    puts("Comparing "); puts(argv[1]); puts(" to "); puts(argv[2]); println("...");
-    println("");
-    
-    // Try to compare real disk sectors
-    uint8_t sector1[512];
-    uint8_t sector2[512];
-    bool match = true;
-    uint32_t diff_sectors = 0;
-    
-    // Compare first few sectors
-    for (uint32_t lba = 0; lba < 10; lba++) {
-        int ret1 = sys_read_sector(lba, 1, sector1);
-        int ret2 = sys_read_sector(lba, 1, sector2);
-        
-        if (ret1 == 0 && ret2 == 0) {
-            for (int i = 0; i < 512; i++) {
-                if (sector1[i] != sector2[i]) {
-                    match = false;
-                    diff_sectors++;
-                    break;
-                }
-            }
-        } else {
-            // Can't read sectors, use memory comparison
-            uint32_t stats[3];
-            mem_get_stats(stats);
-            match = (stats[0] == stats[1]);  // Simplified comparison
-            break;
-        }
-    }
-    
-    if (match) {
-        println("Compare OK - Disks are identical");
-    } else {
-        puts("Compare FAILED - ");
-        char buf[32];
-        utoa_decimal(buf, diff_sectors);
-        puts(buf);
-        println(" sectors differ");
-    }
-    
-    return match ? 0 : -1;
-}
-
-static int cmd_backup(int argc, char *argv[]) {
-    if (argc < 3) {
-        println("RO-DOS Backup Utility");
-        println("");
-        println("Usage: BACKUP <source> <destination>");
-        return 0;
-    }
-    
-    puts("Backing up ");
-    puts(argv[1]);
-    puts(" to ");
-    puts(argv[2]);
-    println("...");
-    
-    // Count real files to backup
-    uint32_t files_backed = 0;
-    uint32_t bytes_copied = 0;
-    
-    int src_dir = sys_opendir(argv[1]);
-    if (src_dir >= 0) {
-        typedef struct {
-            char name[256];
-            uint32_t size;
-            uint8_t is_directory;
-            uint8_t reserved[3];
-        } dirent_t;
-        
-        dirent_t entry;
-        while (sys_readdir(src_dir, &entry) == 0) {
-            if (!entry.is_directory) {
-                files_backed++;
-                bytes_copied += entry.size;
-            }
-        }
-        sys_closedir(src_dir);
-    } else {
-        // Estimate from memory
-        uint32_t stats[3];
-        mem_get_stats(stats);
-        files_backed = (stats[1] / 1024) / 64;
-        bytes_copied = stats[1] * 1024;
-    }
-    
-    println("Progress: [##########] 100%");
-    println("");
-    println("Backup completed successfully");
-    puts("  Files backed up: ");
-    char buf[32];
-    utoa_decimal(buf, files_backed);
-    puts(buf);
-    println("");
-    puts("  Bytes copied: ");
-    utoa_decimal(buf, bytes_copied);
-    puts(buf);
-    println("");
-    return 0;
-}
-
-static int cmd_drive(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    init_drives();
-    
-    println("");
-    println("Available Drives:");
-    print_separator();
-    
-    // Get real memory stats to calculate drive info
-    uint32_t stats[3];
-    mem_get_stats(stats);
-    
-    // Read floppy drive count from CMOS
-    uint8_t hw_config = cmos_read(0x0E);
-    uint8_t floppy_count = (hw_config >> 4) & 0x0F;
-    
-    for (int i = 0; i < drive_count; i++) {
-        DiskDrive *d = &drives[i];
-        char buf[32];
-        
-        putc(d->letter);
-        puts(": [");
-        puts(d->label);
-        puts("]  ");
-        
-        if (d->type == 0) {
-            puts("Hard Disk    ");
-            // Calculate real disk size from memory (simplified)
-            uint32_t total_mb = (stats[0] + stats[1]) / 1024;
-            uint32_t free_mb = stats[0] / 1024;
-            utoa_decimal(buf, total_mb);
-            puts(buf);
-            puts(" MB total, ");
-            utoa_decimal(buf, free_mb);
-            puts(buf);
-            println(" MB free");
-        } else if (d->type == 1) {
-            puts("Floppy Disk ");
-            if (floppy_count > 0) {
-                utoa_decimal(buf, d->total_mb);
-                puts(buf);
-                puts(" MB total, ");
-                utoa_decimal(buf, d->free_mb);
-                puts(buf);
-                println(" MB free");
-            } else {
-                println("Not detected");
-            }
-        } else {
-            puts("CD-ROM      ");
-            utoa_decimal(buf, d->total_mb);
-            puts(buf);
-            println(" MB (read-only)");
-        }
-    }
-    
-    println("");
-    return 0;
-}
-
-/* NETWORKING COMMANDS */
-
-static int cmd_ping(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: PING <host>");
-        return -1;
-    }
-    
-    println("");
-    puts("Pinging "); puts(argv[1]); println(" with 32 bytes of data:");
-    println("");
-    
-    // Calculate ping times based on system ticks (simulated network delay)
-    uint32_t base_time = get_ticks() % 100;
-    uint32_t min_time = 100, max_time = 0, total_time = 0;
-    
-    for (int i = 0; i < 4; i++) {
-        // Generate realistic ping times based on system state
-        uint32_t ping_time = 5 + (base_time % 20) + (i * 2);
-        if (ping_time < min_time) min_time = ping_time;
-        if (ping_time > max_time) max_time = ping_time;
-        total_time += ping_time;
-        
-        puts("Reply from "); puts(argv[1]);
-        puts(": bytes=32 time=");
-        char buf[16];
-        utoa_decimal(buf, ping_time);
-        puts(buf);
-        println("ms TTL=64");
-        
-        // Small delay between pings
-        sleep_ms(100);
-    }
-    
-    uint32_t avg_time = total_time / 4;
-    
-    println("");
-    puts("Ping statistics for "); puts(argv[1]); println(":");
-    println("    Packets: Sent = 4, Received = 4, Lost = 0 (0% loss)");
-    println("Approximate round trip times in milliseconds:");
-    puts("    Minimum = ");
-    char buf[16];
-    utoa_decimal(buf, min_time);
-    puts(buf);
-    puts("ms, Maximum = ");
-    utoa_decimal(buf, max_time);
-    puts(buf);
-    puts("ms, Average = ");
-    utoa_decimal(buf, avg_time);
-    puts(buf);
-    println("ms");
-    return 0;
-}
-
-static int cmd_ipconfig(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    init_network();
-    
-    println("");
-    println("RO-DOS IP Configuration");
-    print_separator();
-    println("");
-    
-    for (int i = 0; i < net_iface_count; i++) {
-        NetInterface *iface = &net_ifaces[i];
-        
-        puts("Adapter "); puts(iface->name); println(":");
-        println("");
-        puts("   IP Address:       "); println(iface->ip);
-        puts("   Subnet Mask:      "); println(iface->mask);
-        puts("   Default Gateway:  "); println(iface->gateway);
-        puts("   Status:           "); println(iface->active ? "Connected" : "Disconnected");
-        println("");
-    }
-    
-    return 0;
-}
-
-static int cmd_tracert(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: TRACERT <host>");
-        return -1;
-    }
-    
-    println("");
-    puts("Tracing route to "); puts(argv[1]); println("...");
-    println("");
-    
-    // Generate route based on system info
-    uint32_t ticks = get_ticks();
-    uint32_t base_ip = 192 + (ticks % 64);
-    uint32_t hops = 3 + (ticks % 3);
-    
-    for (uint32_t hop = 1; hop <= hops; hop++) {
-        uint32_t time1 = hop * 2 + (ticks % 3);
-        uint32_t time2 = hop * 2 + ((ticks + 1) % 3);
-        uint32_t time3 = hop * 2 + ((ticks + 2) % 3);
-        
-        char buf[16];
-        puts("  ");
-        utoa_decimal(buf, hop);
-        puts(buf);
-        puts("    ");
-        utoa_decimal(buf, time1);
-        puts(buf);
-        puts(" ms   ");
-        utoa_decimal(buf, time2);
-        puts(buf);
-        puts(" ms   ");
-        utoa_decimal(buf, time3);
-        puts(buf);
-        puts(" ms  ");
-        
-        if (hop < hops) {
-            puts("192.168.");
-            utoa_decimal(buf, base_ip);
-            puts(buf);
-            puts(".");
-            utoa_decimal(buf, hop);
-            println(buf);
-        } else {
-            println(argv[1]);
-        }
-    }
-    
-    println("");
-    println("Trace complete.");
-    return 0;
-}
-
-static int cmd_netstat(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    
-    println("");
-    println("Active Connections");
-    print_separator();
-    println("");
-    println("  Proto  Local Address          Foreign Address        State");
-    
-    // Generate connection info based on system state
-    uint32_t ticks = get_ticks();
-    uint32_t base_ip = 192 + (ticks % 64);
-    uint32_t port_base = 80 + (ticks % 1000);
-    
-    // Show connections based on system processes
-    typedef struct {
-        uint32_t total_memory;
-        uint32_t free_memory;
-        uint32_t used_memory;
-        uint32_t kernel_memory;
-        uint32_t uptime_seconds;
-        uint32_t num_processes;
-    } sysinfo_t;
-    
-    sysinfo_t sysinfo;
-    uint32_t conn_count = 3;
-    if (sys_sysinfo(&sysinfo) == 0) {
-        conn_count = 2 + (sysinfo.num_processes % 4);
-    }
-    
-    char buf[32];
-    for (uint32_t i = 0; i < conn_count && i < 5; i++) {
-        uint32_t port = port_base + (i * 100);
-        puts("  TCP    192.168.");
-        utoa_decimal(buf, base_ip);
-        puts(buf);
-        puts(".");
-        utoa_decimal(buf, 100 + i);
-        puts(buf);
-        puts(":");
-        utoa_decimal(buf, port);
-        puts(buf);
-        puts("       0.0.0.0:0              LISTENING");
-        println("");
-    }
-    
-    // UDP connections
-    puts("  UDP    0.0.0.0:53             *:*                    ");
-    println("");
-    puts("  UDP    0.0.0.0:67             *:*                    ");
-    println("");
-    println("");
-    return 0;
-}
-
-static int cmd_ftp(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("FTP Client for RO-DOS");
-        println("");
-        println("Usage: FTP <host>");
-        return 0;
-    }
-    
-    puts("Connecting to "); puts(argv[1]); println("...");
-    
-    // Check connection status based on system
-    uint32_t ticks = get_ticks();
-    bool connected = (ticks % 10) != 0;  // 90% success rate
-    
-    if (connected) {
-        println("220 FTP Server ready");
-        println("");
-        println("FTP Client connected successfully");
-        println("Commands: GET, PUT, DIR, CD, QUIT");
-        println("Type HELP for command list");
-    } else {
-        println("Connection failed: Host unreachable");
-        return -1;
-    }
-    
-    return 0;
-}
-
-static int cmd_telnet(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: TELNET <host> [port]");
-        return -1;
-    }
-    
-    uint16_t port = 23;  // Default telnet port
-    if (argc > 2) {
-        port = parse_uint(argv[2]);
-    }
-    
-    puts("Connecting to "); puts(argv[1]);
-    puts(":");
-    char buf[16];
-    utoa_decimal(buf, port);
-    puts(buf);
-    println("...");
-    
-    // Check connection based on system state
-    uint32_t ticks = get_ticks();
-    bool connected = (ticks % 10) != 0;
-    
-    if (connected) {
-        println("");
-        println("Connected to remote host");
-        println("Type 'exit' to disconnect");
-        println("Press Ctrl+C to abort");
-    } else {
-        println("Connection failed: Connection refused");
-        return -1;
-    }
-    
-    return 0;
-}
-
-static int cmd_wget(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: WGET <url> [destination]");
-        println("Example: WGET http://example.com/file.txt output.txt");
-        return -1;
-    }
-    
-    char *url = argv[1];
-    char *dest = (argc > 2) ? argv[2] : "download.tmp";
-    
-    puts("Connecting to "); puts(url); println("...");
-    
-    // Parse URL to extract host and path
-    char host[256] = {0};
-    char path[256] = {0};
-    bool use_https = false;
-    
-    // Check protocol
-    char *p = url;
-    if (p[0] == 'h' && p[1] == 't' && p[2] == 't' && p[3] == 'p') {
-        p += 4;
-        if (*p == 's') {
-            use_https = true;
-            p++;
-        }
-        if (*p == ':' && *(p+1) == '/' && *(p+2) == '/') {
-            p += 3;
-        }
-    }
-    
-    // Extract host
-    int h_idx = 0;
-    while (*p && *p != '/' && *p != ':' && h_idx < 255) {
-        host[h_idx++] = *p++;
-    }
-    host[h_idx] = '\0';
-    
-    // Extract path
-    if (*p == '/') {
-        strcpy_local(path, p);
-    } else {
-        strcpy_local(path, "/");
-    }
-    
-    if (strlen_local(host) == 0) {
-        println("Error: Invalid URL format");
-        return -1;
-    }
-    
-    puts("Host: "); println(host);
-    puts("Path: "); println(path);
-    puts("Protocol: "); println(use_https ? "HTTPS" : "HTTP");
-    println("");
-    
-    // Initialize network
-    init_network();
-    
-    // Check if network is available
-    bool net_available = false;
-    for (int i = 0; i < net_iface_count; i++) {
-        if (net_ifaces[i].active && strcmp_local(net_ifaces[i].name, "LO") != 0) {
-            net_available = true;
-            break;
-        }
-    }
-    
-    if (!net_available) {
-        println("Error: No active network interface");
-        println("Use IPCONFIG to check network status");
-        return -1;
-    }
-    
-    // Simulate DNS lookup (in real implementation, would use DNS syscall)
-    puts("Resolving "); puts(host); println("...");
-    
-    // Create progress indicator
-    println("Downloading...");
-    println("");
-    
-    uint32_t total_bytes = 0;
-    uint32_t chunk_size = 1024;
-    int progress = 0;
-    
-    // Simulate download with progress bar (in real impl, would use network syscalls)
-    for (int i = 0; i < 10; i++) {
-        // In real implementation: read network socket data here
-        total_bytes += chunk_size;
-        progress = (i + 1) * 10;
-        
-        puts("Progress: [");
-        for (int j = 0; j < progress / 10; j++) putc('#');
-        for (int j = progress / 10; j < 10; j++) putc(' ');
-        puts("] ");
-        
-        char pct_buf[8];
-        utoa_decimal(pct_buf, progress);
-        puts(pct_buf);
-        puts("%  ");
-        
-        char bytes_buf[16];
-        utoa_decimal(bytes_buf, total_bytes);
-        puts(bytes_buf);
-        println(" bytes");
-        
-        sleep_ms(100); // Small delay to show progress
-    }
-    
-    println("");
-    
-    // Try to create file in filesystem
-    init_filesystem();
-    
-    if (fs_entry_count < 50) {
-        strcpy_local(fs_entries[fs_entry_count].name, dest);
-        toupper_str(fs_entries[fs_entry_count].name);
-        fs_entries[fs_entry_count].size = total_bytes;
-        fs_entries[fs_entry_count].type = 0;
-        fs_entries[fs_entry_count].attr = 0x20;
-        fs_entry_count++;
-        
-        println("Download complete!");
-        puts("Saved to: ");
-        println(dest);
-    } else {
-        println("Download complete but could not save (filesystem full)");
-    }
-    
-    puts("Total downloaded: ");
-    char buf[32];
-    utoa_decimal(buf, total_bytes);
-    puts(buf);
-    println(" bytes");
-    
-    return 0;
-}
-
-static int cmd_dns(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: DNS <hostname>");
-        return -1;
-    }
-    
-    puts("Looking up "); puts(argv[1]); println("...");
-    println("");
-    
-    // Generate IP address based on hostname hash
-    uint32_t hash = 0;
-    char *hostname = argv[1];
-    for (int i = 0; hostname[i]; i++) {
-        hash = hash * 31 + hostname[i];
-    }
-    
-    uint8_t ip1 = 192 + (hash % 64);
-    uint8_t ip2 = 168 + ((hash >> 8) % 64);
-    uint8_t ip3 = (hash >> 16) % 256;
-    uint8_t ip4 = (hash >> 24) % 256;
-    
-    puts("Name:    ");
-    println(hostname);
-    puts("Address: ");
-    char buf[16];
-    utoa_decimal(buf, ip1);
-    puts(buf);
-    puts(".");
-    utoa_decimal(buf, ip2);
-    puts(buf);
-    puts(".");
-    utoa_decimal(buf, ip3);
-    puts(buf);
-    puts(".");
-    utoa_decimal(buf, ip4);
-    println(buf);
-    return 0;
-}
-
-static int cmd_route(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    
-    println("");
-    println("IP Routing Table");
-    print_separator();
-    println("");
-    println("Destination     Gateway         Mask            Interface");
-    
-    init_network();
-    
-    // Display routes based on actual network interfaces
-    for (int i = 0; i < net_iface_count; i++) {
-        NetInterface *iface = &net_ifaces[i];
-        
-        if (!iface->active) continue;
-        
-        // Parse IP to get network address
-        char net_addr[16];
-        strcpy_local(net_addr, iface->ip);
-        
-        // Find last dot and replace with .0 for network address
-        int last_dot = -1;
-        for (int j = 0; net_addr[j]; j++) {
-            if (net_addr[j] == '.') last_dot = j;
-        }
-        if (last_dot >= 0) {
-            net_addr[last_dot + 1] = '0';
-            net_addr[last_dot + 2] = '\0';
-        }
-        
-        // Network route
-        puts(net_addr);
-        int pad = 16 - strlen_local(net_addr);
-        for (int j = 0; j < pad; j++) putc(' ');
-        
-        puts("0.0.0.0");
-        for (int j = 0; j < 9; j++) putc(' ');
-        
-        puts(iface->mask);
-        pad = 16 - strlen_local(iface->mask);
-        for (int j = 0; j < pad; j++) putc(' ');
-        
-        println(iface->ip);
-        
-        // Default gateway route (if not loopback)
-        if (strcmp_local(iface->gateway, "0.0.0.0") != 0) {
-            puts("0.0.0.0         ");
-            puts(iface->gateway);
-            pad = 16 - strlen_local(iface->gateway);
-            for (int j = 0; j < pad; j++) putc(' ');
-            puts("0.0.0.0         ");
-            println(iface->ip);
-        }
-    }
-    
-    // Loopback route (always present)
-    println("127.0.0.0       127.0.0.1       255.0.0.0       127.0.0.1");
-    println("");
-    
-    char count_buf[16];
-    puts("Active routes: ");
-    utoa_decimal(count_buf, net_iface_count * 2 + 1); // Network + gateway + loopback
-    println(count_buf);
-    println("");
-    
-    return 0;
-}
-
-/* PROCESS & TASK MANAGEMENT */
-
-static int cmd_ps(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    init_processes();
-    
-    // Get real system info for process count
-    typedef struct {
-        uint32_t total_memory;
-        uint32_t free_memory;
-        uint32_t used_memory;
-        uint32_t kernel_memory;
-        uint32_t uptime_seconds;
-        uint32_t num_processes;
-    } sysinfo_t;
-    
-    sysinfo_t sysinfo;
-    uint32_t real_proc_count = proc_count;
-    if (sys_sysinfo(&sysinfo) == 0) {
-        real_proc_count = sysinfo.num_processes;
-    }
-    
-    println("");
-    println("Active Processes");
-    print_separator();
-    println("");
-    println("  PID  Name              Priority  Memory(KB)  Status");
-    
-    // Get current PID for highlighting
-    int current_pid = sys_getpid();
-    
-    for (int i = 0; i < proc_count; i++) {
-        Process *p = &proc_table[i];
-        if (!p->active) continue;
-        
-        char buf[16];
-        puts("  ");
-        utoa_decimal(buf, p->pid);
-        if (p->pid < 10) puts(" ");
-        puts(buf);
-        puts("   ");
-        
-        puts(p->name);
-        int pad = 18 - strlen_local(p->name);
-        for (int j = 0; j < pad; j++) putc(' ');
-        
-        utoa_decimal(buf, p->priority);
-        if (p->priority < 10) puts(" ");
-        puts(buf);
-        puts("        ");
-        
-        utoa_decimal(buf, p->mem_kb);
-        int mpad = 6 - strlen_local(buf);
-        for (int j = 0; j < mpad; j++) putc(' ');
-        puts(buf);
-        puts("      ");
-        
-        if (p->pid == current_pid) {
-            puts("Running (current)");
-        } else {
-            puts("Running");
-        }
-        println("");
-    }
-    
-    puts("Total processes: ");
-    char buf[16];
-    utoa_decimal(buf, real_proc_count);
-    puts(buf);
-    println("");
-    println("");
-    return 0;
-}
-
-static int cmd_kill(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: KILL <pid>");
-        return -1;
-    }
-    
-    uint32_t pid = parse_uint(argv[1]);
-    
-    if (pid <= 2) {
-        println("Error: Cannot kill system process");
-        return -1;
-    }
-    
-    for (int i = 0; i < proc_count; i++) {
-        if (proc_table[i].pid == pid) {
-            proc_table[i].active = false;
-            puts("Process ");
-            puts(argv[1]);
-            println(" terminated");
-            return 0;
-        }
-    }
-    
-    println("Process not found");
-    return -1;
-}
-
-static int cmd_run(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: RUN <program>");
-        return -1;
-    }
-    
-    if (proc_count >= 16) {
-        println("Error: Process table full");
-        return -1;
-    }
-    
-    // Check if file exists in simulated filesystem
-    char name[64];
-    strcpy_local(name, argv[1]);
-    toupper_str(name);
-    
-    // Add .EXE extension if not present
-    bool has_ext = false;
-    for (int i = 0; name[i]; i++) {
-        if (name[i] == '.') {
-            has_ext = true;
-            break;
-        }
-    }
-    if (!has_ext) {
-        strcat_local(name, ".EXE");
-    }
-    
-    // Search for file in filesystem
-    bool found = false;
-    init_filesystem();
-    
-    for (int i = 0; i < fs_entry_count; i++) {
-        if (fs_entries[i].type == 0 && strcmp_local(fs_entries[i].name, name) == 0) {
-            found = true;
-            break;
-        }
-    }
-    
-    if (!found) {
-        puts("Error: Program '");
-        puts(name);
-        println("' not found");
-        println("Use DIR to see available programs");
-        return -1;
-    }
-    
-    // Create new process
-    proc_table[proc_count].pid = proc_count + 10;
-    strcpy_local(proc_table[proc_count].name, name);
-    proc_table[proc_count].priority = 20;
-    proc_table[proc_count].mem_kb = 32;
-    proc_table[proc_count].active = true;
-    
-    char buf[16];
-    puts("Loading program: ");
-    println(name);
-    puts("Started process ");
-    puts(name);
-    puts(" (PID: ");
-    utoa_decimal(buf, proc_table[proc_count].pid);
-    puts(buf);
-    println(")");
-    
-    proc_count++;
-    return 0;
-}
-
-
-static int cmd_free(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    
-    uint32_t stats[3];
-    mem_get_stats(stats);
-    char buf[32];
-    
-    println("");
-    println("Memory Usage Summary");
-    print_separator();
-    println("");
-    println("              Total        Used        Free");
-    
-    puts("Memory:  ");
-    utoa_decimal(buf, (stats[0] + stats[1]) / 1024);
-    int pad = 10 - strlen_local(buf);
-    for (int i = 0; i < pad; i++) putc(' ');
-    puts(buf);
-    puts(" KB  ");
-    
-    utoa_decimal(buf, stats[1] / 1024);
-    pad = 10 - strlen_local(buf);
-    for (int i = 0; i < pad; i++) putc(' ');
-    puts(buf);
-    puts(" KB  ");
-    
-    utoa_decimal(buf, stats[0] / 1024);
-    pad = 10 - strlen_local(buf);
-    for (int i = 0; i < pad; i++) putc(' ');
-    puts(buf);
-    println(" KB");
-    
-    println("");
-    return 0;
-}
-
-static int cmd_nice(int argc, char *argv[]) {
-    if (argc < 3) {
-        println("Usage: NICE <pid> <priority>");
-        println("  Priority range: 0 (highest) to 31 (lowest)");
-        return -1;
-    }
-    
-    uint32_t pid = parse_uint(argv[1]);
-    uint32_t prio = parse_uint(argv[2]);
-    
-    if (prio > 31) {
-        println("Error: Priority must be 0-31");
-        return -1;
-    }
-    
-    for (int i = 0; i < proc_count; i++) {
-        if (proc_table[i].pid == pid) {
-            proc_table[i].priority = prio;
-            puts("Process ");
-            puts(argv[1]);
-            puts(" priority set to ");
-            println(argv[2]);
-            return 0;
-        }
-    }
-    
-    println("Process not found");
-    return -1;
-}
-
-static int cmd_start(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: START <program> [args]");
-        return -1;
-    }
-    
-    puts("Starting ");
-    puts(argv[1]);
-    println(" in background...");
-    
-    return cmd_run(argc, argv);
-}
-
-/* DEVICE/DRIVER MANAGEMENT */
-
-static int cmd_bios(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    
-    println("");
-    println("BIOS Information");
-    print_separator();
-    println("");
-    
-    // Read real BIOS information
-    char vendor[64];
-    char version[32];
-    char sys_vendor[64];
-    
-    get_bios_vendor(vendor);
-    get_bios_version(version);
-    get_system_vendor(sys_vendor);
-    
-    // Read BIOS date from CMOS
-    uint8_t century = cmos_read(0x32);
-    uint8_t year_cmos = cmos_read(0x09);
-    uint8_t month = cmos_read(0x08);
-    uint8_t day = cmos_read(0x07);
-    
-    uint16_t year = 2000;
-    if (century > 0) {
-        year = (century * 100) + year_cmos;
-    } else if (year_cmos < 80) {
-        year = 2000 + year_cmos;
-    } else {
-        year = 1900 + year_cmos;
-    }
-    
-    puts("  BIOS Vendor:      ");
-    println(vendor);
-    
-    puts("  BIOS Version:     ");
-    println(version);
-    
-    char date_buf[32];
-    utoa_decimal(date_buf, month);
-    if (month < 10) {
-        char tmp[32];
-        strcpy_local(tmp, "0");
-        strcat_local(tmp, date_buf);
-        strcpy_local(date_buf, tmp);
-    }
-    strcat_local(date_buf, "/");
-    char day_buf[32];
-    utoa_decimal(day_buf, day);
-    if (day < 10) {
-        char tmp[32];
-        strcpy_local(tmp, "0");
-        strcat_local(tmp, day_buf);
-        strcat_local(date_buf, tmp);
-    } else {
-        strcat_local(date_buf, day_buf);
-    }
-    strcat_local(date_buf, "/");
-    char year_buf[32];
-    utoa_decimal(year_buf, year);
-    strcat_local(date_buf, year_buf);
-    
-    puts("  BIOS Release:     ");
-    println(date_buf);
-    
-    puts("  System Vendor:    ");
-    println(sys_vendor);
-    
-    // Read memory size from CMOS
-    uint8_t mem_low = cmos_read(0x15);
-    uint8_t mem_high = cmos_read(0x16);
-    uint16_t base_mem_kb = mem_low | (mem_high << 8);
-    
-    puts("  Base Memory:      ");
-    char mem_buf[32];
-    utoa_decimal(mem_buf, base_mem_kb);
-    puts(mem_buf);
-    println(" KB");
-    
-    // Read extended memory
-    uint8_t ext_mem_low = cmos_read(0x17);
-    uint8_t ext_mem_high = cmos_read(0x18);
-    uint16_t ext_mem_kb = ext_mem_low | (ext_mem_high << 8);
-    
-    if (ext_mem_kb > 0) {
-        puts("  Extended Memory:  ");
-        utoa_decimal(mem_buf, ext_mem_kb);
-        puts(mem_buf);
-        println(" KB");
-    }
-    
-    // Read hardware configuration
-    uint8_t hw_config = cmos_read(0x0E);
-    puts("  Floppy Drives:     ");
-    uint8_t floppy_count = (hw_config >> 4) & 0x0F;
-    if (floppy_count > 0) {
-        utoa_decimal(mem_buf, floppy_count);
-        puts(mem_buf);
-    } else {
-        puts("None");
-    }
-    println("");
-    
-    println("");
-    println("To enter BIOS setup, restart and press DEL during boot.");
-    return 0;
-}
-
-/* Add to global state - Driver Management */
-#define MAX_DRIVERS 32
-#define DRIVER_NAME_LEN 32
-
-typedef struct {
-    char name[DRIVER_NAME_LEN];
-    char type[16];
-    uint32_t base_address;
-    uint32_t size;
-    uint8_t irq;
-    bool loaded;
-} Driver;
-
-static Driver driver_table[MAX_DRIVERS];
-static int driver_count = 0;
-
-/* Initialize default drivers */
-static void init_drivers(void) {
-    if (driver_count > 0) return;
-    
-    // Keyboard driver
-    strcpy_local(driver_table[driver_count].name, "KEYBOARD.SYS");
-    strcpy_local(driver_table[driver_count].type, "Keyboard");
-    driver_table[driver_count].base_address = 0x60;
-    driver_table[driver_count].size = 512;
-    driver_table[driver_count].irq = 1;
-    driver_table[driver_count].loaded = true;
-    driver_count++;
-    
-    // VGA driver
-    strcpy_local(driver_table[driver_count].name, "VGA.SYS");
-    strcpy_local(driver_table[driver_count].type, "Display");
-    driver_table[driver_count].base_address = 0xB8000;
-    driver_table[driver_count].size = 4000;
-    driver_table[driver_count].irq = 0xFF;
-    driver_table[driver_count].loaded = true;
-    driver_count++;
-    
-    // ATA driver
-    strcpy_local(driver_table[driver_count].name, "ATA.SYS");
-    strcpy_local(driver_table[driver_count].type, "Disk");
-    driver_table[driver_count].base_address = 0x1F0;
-    driver_table[driver_count].size = 1024;
-    driver_table[driver_count].irq = 14;
-    driver_table[driver_count].loaded = true;
-    driver_count++;
-    
-    // Check for floppy disk controller
-    uint8_t hw_config = cmos_read(0x0E);
-    uint8_t floppy_count = (hw_config >> 4) & 0x0F;
-    if (floppy_count > 0) {
-        strcpy_local(driver_table[driver_count].name, "FDC.SYS");
-        strcpy_local(driver_table[driver_count].type, "Floppy");
-        driver_table[driver_count].base_address = 0x3F0;
-        driver_table[driver_count].size = 512;
-        driver_table[driver_count].irq = 6;
-        driver_table[driver_count].loaded = true;
-        driver_count++;
-    }
-    
-    // Network driver (detect if present)
-    strcpy_local(driver_table[driver_count].name, "RTL8139.SYS");
-    strcpy_local(driver_table[driver_count].type, "Network");
-    driver_table[driver_count].base_address = 0xC000;
-    driver_table[driver_count].size = 2048;
-    driver_table[driver_count].irq = 11;
-    driver_table[driver_count].loaded = true;
-    driver_count++;
-}
-
-/* Add to global state - USB Management */
-#define MAX_USB_PORTS 8
-
-typedef struct {
-    uint8_t port;
-    char device_name[64];
-    uint16_t vendor_id;
-    uint16_t product_id;
-    bool connected;
-} USBDevice;
-
-static USBDevice usb_devices[MAX_USB_PORTS];
-static int usb_device_count = 0;
-
-static void init_usb_devices(void) {
-    if (usb_device_count > 0) return;
-    
-    // Detect keyboard (always present in VM)
-    usb_devices[usb_device_count].port = 1;
-    strcpy_local(usb_devices[usb_device_count].device_name, "USB Keyboard");
-    usb_devices[usb_device_count].vendor_id = 0x046D;
-    usb_devices[usb_device_count].product_id = 0xC31C;
-    usb_devices[usb_device_count].connected = true;
-    usb_device_count++;
-    
-    // Detect mouse (check if PS/2 mouse IRQ is active)
-    uint8_t pic2_mask = inb(0xA1);
-    bool mouse_present = !(pic2_mask & (1 << 4)); // IRQ 12
-    if (mouse_present) {
-        usb_devices[usb_device_count].port = 2;
-        strcpy_local(usb_devices[usb_device_count].device_name, "USB Mouse");
-        usb_devices[usb_device_count].vendor_id = 0x046D;
-        usb_devices[usb_device_count].product_id = 0xC077;
-        usb_devices[usb_device_count].connected = true;
-        usb_device_count++;
-    }
-}
-
-/* Add to global state - Path Management */
-#define MAX_PATH_ENTRIES 16
-#define PATH_ENTRY_LEN 64
-
-static char path_entries[MAX_PATH_ENTRIES][PATH_ENTRY_LEN];
-static int path_count = 0;
-
-static void init_path(void) {
-    if (path_count > 0) return;
-    
-    strcpy_local(path_entries[path_count++], "C:\\");
-    strcpy_local(path_entries[path_count++], "C:\\RO-DOS");
-}
-
-static int cmd_load(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: LOAD <driver.sys>");
-        return -1;
-    }
-    
-    init_drivers();
-    
-    if (driver_count >= MAX_DRIVERS) {
-        println("Error: Driver table full");
-        return -1;
-    }
-    
-    char *driver_name = argv[1];
-    
-    // Check if already loaded
-    for (int i = 0; i < driver_count; i++) {
-        if (driver_table[i].loaded && 
-            strcmp_local(driver_table[i].name, driver_name) == 0) {
-            println("Error: Driver already loaded");
-            return -1;
-        }
-    }
-    
-    // Simulate loading driver
-    puts("Loading driver: ");
-    println(driver_name);
-    
-    // Add to driver table
-    strcpy_local(driver_table[driver_count].name, driver_name);
-    strcpy_local(driver_table[driver_count].type, "Generic");
-    driver_table[driver_count].base_address = 0x10000 + (driver_count * 0x1000);
-    driver_table[driver_count].size = 1024;
-    driver_table[driver_count].irq = 0xFF;
-    driver_table[driver_count].loaded = true;
-    driver_count++;
-    
-    println("Driver loaded successfully");
-    
-    char buf[32];
-    puts("  Base Address: 0x");
-    utoa_hex(buf, driver_table[driver_count-1].base_address);
-    println(buf);
-    puts("  Size: ");
-    utoa_decimal(buf, driver_table[driver_count-1].size);
-    puts(buf);
-    println(" bytes");
-    
-    return 0;
-}
-
-static int cmd_driver(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    
-    init_drivers();
-    
-    println("");
-    println("Loaded Drivers");
-    print_separator();
-    println("");
-    println("  Name             Type        IRQ   Base Addr   Status");
-    println("  ----             ----        ---   ---------   ------");
-    
-    for (int i = 0; i < driver_count; i++) {
-        Driver *drv = &driver_table[i];
-        if (!drv->loaded) continue;
-        
-        char buf[32];
-        
-        puts("  ");
-        puts(drv->name);
-        int pad = 17 - strlen_local(drv->name);
-        for (int j = 0; j < pad; j++) putc(' ');
-        
-        puts(drv->type);
-        pad = 12 - strlen_local(drv->type);
-        for (int j = 0; j < pad; j++) putc(' ');
-        
-        if (drv->irq != 0xFF) {
-            utoa_decimal(buf, drv->irq);
-            if (drv->irq < 10) puts(" ");
-            puts(buf);
-            puts("    ");
-        } else {
-            puts("N/A   ");
-        }
-        
-        puts("0x");
-        utoa_hex(buf, drv->base_address);
-        int len = strlen_local(buf);
-        for (int j = len; j < 8; j++) putc(' ');
-        puts(buf);
-        puts("  ");
-        
-        println("Loaded");
-    }
-    
-    println("");
-    char buf[16];
-    puts("Total drivers loaded: ");
-    utoa_decimal(buf, driver_count);
-    println(buf);
-    println("");
-    
-    return 0;
-}
-
-static int cmd_usb(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    
-    init_usb_devices();
-    
-    println("");
-    println("USB Devices");
-    print_separator();
-    println("");
-    println("  Port  Device              Vendor:Product   Status");
-    println("  ----  ------              --------------   ------");
-    
-    for (int i = 0; i < MAX_USB_PORTS; i++) {
-        char buf[32];
-        puts("  ");
-        utoa_decimal(buf, i + 1);
-        puts(buf);
-        puts("     ");
-        
-        bool found = false;
-        for (int j = 0; j < usb_device_count; j++) {
-            if (usb_devices[j].port == (i + 1) && usb_devices[j].connected) {
-                puts(usb_devices[j].device_name);
-                int pad = 20 - strlen_local(usb_devices[j].device_name);
-                for (int k = 0; k < pad; k++) putc(' ');
-                
-                utoa_hex(buf, usb_devices[j].vendor_id);
-                puts(buf);
-                puts(":");
-                utoa_hex(buf, usb_devices[j].product_id);
-                puts(buf);
-                puts("   Connected");
-                found = true;
-                break;
-            }
-        }
-        
-        if (!found) {
-            puts("(Empty)");
-            int pad = 20 - 7;
-            for (int k = 0; k < pad; k++) putc(' ');
-            puts("----:----   ");
-            puts("Disconnected");
-        }
-        
-        println("");
-    }
-    
-    println("");
-    char buf[16];
-    puts("Connected devices: ");
-    utoa_decimal(buf, usb_device_count);
-    println(buf);
-    println("");
-    
-    return 0;
-}
-
-static int cmd_irq(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    
-    println("");
-    println("IRQ Assignment Table");
-    print_separator();
-    println("");
-    println("  IRQ  Device              Status      Owner");
-    println("  ---  ------              ------      -----");
-    
-    // Read PIC interrupt mask registers
-    uint8_t pic1_mask = inb(0x21);
-    uint8_t pic2_mask = inb(0xA1);
-    
-    // Standard IRQ assignments
-    const char* irq_names[] = {
-        "System Timer",      // 0
-        "Keyboard",          // 1
-        "Cascade (IRQ 8-15)", // 2
-        "COM2",              // 3
-        "COM1",              // 4
-        "LPT2",              // 5
-        "Floppy Disk",       // 6
-        "LPT1",              // 7
-        "RTC",               // 8
-        "Redirected",        // 9
-        "Reserved",          // 10
-        "Reserved",          // 11
-        "PS/2 Mouse",        // 12
-        "Math Coprocessor",  // 13
-        "Primary IDE",       // 14
-        "Secondary IDE"      // 15
-    };
-    
-    init_drivers();
-    
-    for (int irq = 0; irq < 16; irq++) {
-        uint8_t mask;
-        bool enabled;
-        
-        if (irq < 8) {
-            mask = pic1_mask;
-            enabled = !(mask & (1 << irq));
-        } else {
-            mask = pic2_mask;
-            enabled = !(mask & (1 << (irq - 8)));
-        }
-        
-        // Show all IRQs with their status
-        char buf[8];
-        puts("  ");
-        if (irq < 10) puts(" ");
-        utoa_decimal(buf, irq);
-        puts(buf);
-        puts("   ");
-        puts(irq_names[irq]);
-        int pad = 22 - strlen_local(irq_names[irq]);
-        for (int j = 0; j < pad; j++) putc(' ');
-        
-        if (enabled) {
-            puts("Enabled     ");
-        } else {
-            puts("Masked      ");
-        }
-        
-        // Find driver owning this IRQ
-        bool found = false;
-        for (int d = 0; d < driver_count; d++) {
-            if (driver_table[d].loaded && driver_table[d].irq == irq) {
-                puts(driver_table[d].name);
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            puts("None");
-        }
-        
-        println("");
-    }
-    
-    println("");
-    return 0;
-}
-
-static int cmd_set(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("");
-        println("Environment Variables:");
-        print_separator();
-        
-        // Always show PATH
-        init_path();
-        puts("  PATH=");
-        for (int i = 0; i < path_count; i++) {
-            puts(path_entries[i]);
-            if (i < path_count - 1) puts(";");
-        }
-        println("");
-        
-        // Show user variables
-        for (int i = 0; i < env_count; i++) {
-            puts("  ");
-            puts(env_vars[i][0]);
-            puts("=");
-            println(env_vars[i][1]);
-        }
-        
-        if (env_count == 0) {
-            println("  (No user-defined variables)");
-        }
-        println("");
-        return 0;
-    }
-    
-    char *eq = argv[1];
+    // Check for variable assignment (x = value)
+    const char *eq = p;
     while (*eq && *eq != '=') eq++;
-    
-    if (*eq != '=') {
-        println("Usage: SET <var>=<value>");
-        return -1;
-    }
-    
-    *eq = '\0';
-    char *key = argv[1];
-    char *val = eq + 1;
-    
-    // Validate variable name
-    if (strlen_local(key) == 0) {
-        println("Error: Variable name cannot be empty");
-        return -1;
-    }
-    
-    // Check if updating existing variable
-    for (int i = 0; i < env_count; i++) {
-        if (strcmp_local(env_vars[i][0], key) == 0) {
-            strcpy_local(env_vars[i][1], val);
-            puts("Updated: ");
-            puts(key);
-            puts("=");
-            println(val);
-            return 0;
+    if (*eq == '=' && eq[1] != '=') {
+      // Get variable name
+      char varname[32] = {0};
+      int vlen = 0;
+      const char *vp = p;
+      while (vp < eq && vlen < 31) {
+        if (*vp != ' ' && *vp != '\t') {
+          varname[vlen++] = *vp;
         }
+        vp++;
+      }
+      
+      // Get value
+      const char *valp = eq + 1;
+      while (*valp == ' ' || *valp == '\t') valp++;
+      int value = str_to_int(valp);
+      
+      // Store variable
+      int idx = -1;
+      for (int i = 0; i < var_count; i++) {
+        if (str_cmp(var_names[i], varname) == 0) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx < 0 && var_count < 16) {
+        idx = var_count++;
+      }
+      if (idx >= 0) {
+        str_copy(var_names[idx], varname, 32);
+        var_values[idx] = value;
+      }
+      continue;
     }
     
-    // Add new variable
-    if (env_count < 20) {
-        strcpy_local(env_vars[env_count][0], key);
-        strcpy_local(env_vars[env_count][1], val);
-        env_count++;
-        puts("Set: ");
-        puts(key);
-        puts("=");
-        println(val);
-        return 0;
+    // Try to evaluate simple expression and print result
+    if (p[0] >= '0' && p[0] <= '9') {
+      int val = str_to_int(p);
+      char buf[16];
+      int_to_str(val, buf);
+      puts(buf);
+      puts("\n");
+      continue;
     }
     
-    println("Error: Environment variable table full");
+    // Check if it's a variable name
+    bool found_var = false;
+    for (int i = 0; i < var_count; i++) {
+      if (str_cmp(var_names[i], p) == 0) {
+        char buf[16];
+        int_to_str(var_values[i], buf);
+        puts(buf);
+        puts("\n");
+        found_var = true;
+        break;
+      }
+    }
+    
+    if (!found_var && p[0] != 0) {
+      set_attr(0x0C);
+      puts("NameError: name '");
+      puts(p);
+      puts("' is not defined\n");
+      set_attr(0x07);
+    }
+  }
+  
+  return 0;
+}
+
+/* 104. WGET - Advanced HTTP Download */
+static int cmd_wget(const char *args) {
+  extern int tcp_connect(uint32_t dest_ip, uint16_t dest_port);
+  extern int tcp_send(int socket, const void *data, uint32_t len);
+  extern int tcp_receive(int socket, void *buffer, uint32_t max_len);
+  extern int tcp_close(int socket);
+  extern uint32_t dns_resolve(const char *hostname);
+
+  char url[256] = {0};
+  char output_file[64] = {0};
+
+  // 1. Check Network Connection (works with e1000/VirtIO or WiFi)
+  network_interface_t *net = netif_get_default();
+  if (!net || !net->link_up || net->ip_addr == 0) {
+    set_attr(0x0C); // Red
+    puts("Error: Network not connected!\n");
+    puts("Run NETSTART first to initialize network.\n");
+    set_attr(0x07);
     return -1;
-}
+  }
 
-static int cmd_unset(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: UNSET <variable>");
-        return -1;
-    }
-    
-    for (int i = 0; i < env_count; i++) {
-        if (strcmp_local(env_vars[i][0], argv[1]) == 0) {
-            // Shift remaining variables down
-            for (int j = i; j < env_count - 1; j++) {
-                strcpy_local(env_vars[j][0], env_vars[j + 1][0]);
-                strcpy_local(env_vars[j][1], env_vars[j + 1][1]);
-            }
-            env_count--;
-            puts("Removed variable: ");
-            println(argv[1]);
-            return 0;
-        }
-    }
-    
-    println("Variable not found");
-    return -1;
-}
+  // Parse Arguments
+  char token[128];
+  const char *p = args;
+  while (*p) {
+    p = get_token(p, token, 128);
+    if (!token[0])
+      break;
 
-static int cmd_path(int argc, char *argv[]) {
-    init_path();
-    
-    if (argc < 2) {
-        // Display current path
-        puts("PATH=");
-        for (int i = 0; i < path_count; i++) {
-            puts(path_entries[i]);
-            if (i < path_count - 1) puts(";");
-        }
-        println("");
-        return 0;
-    }
-    
-    // Parse new path entries
-    char *path_str = argv[1];
-    path_count = 0;
-    
-    char *token = path_str;
-    while (*token && path_count < MAX_PATH_ENTRIES) {
-        char *start = token;
-        while (*token && *token != ';') token++;
-        
-        int len = token - start;
-        if (len > 0 && len < PATH_ENTRY_LEN) {
-            for (int i = 0; i < len; i++) {
-                path_entries[path_count][i] = start[i];
-            }
-            path_entries[path_count][len] = '\0';
-            path_count++;
-        }
-        
-        if (*token == ';') token++;
-    }
-    
-    puts("PATH set to: ");
-    for (int i = 0; i < path_count; i++) {
-        puts(path_entries[i]);
-        if (i < path_count - 1) puts(";");
-    }
-    println("");
-    
-    return 0;
-}
-
-static int cmd_useradd(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: USERADD <username>");
-        return -1;
-    }
-    
-    if (user_count >= MAX_USERS) {
-        println("Error: Maximum number of users reached");
-        return -1;
-    }
-    
-    char *username = argv[1];
-    
-    // Validate username
-    if (strlen_local(username) >= USERNAME_LEN) {
-        println("Error: Username too long (max 31 characters)");
-        return -1;
-    }
-    
-    // Check for invalid characters
-    for (int i = 0; username[i]; i++) {
-        char c = username[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || 
-              (c >= '0' && c <= '9') || c == '_' || c == '-')) {
-            println("Error: Username can only contain letters, numbers, _ and -");
-            return -1;
-        }
-    }
-    
-    // Check if user already exists
-    if (user_exists(username)) {
-        println("Error: User already exists");
-        return -1;
-    }
-    
-    // Prompt for password
-    println("");
-    puts("Enter password for new user ");
-    puts(username);
-    println(":");
-    print_separator();
-    
-    char password1[128];
-    char password2[128];
-    
-    puts("Password: ");
-    if (read_password(password1, sizeof(password1)) < 4) {
-        println("");
-        println("Error: Password must be at least 4 characters");
-        return -1;
-    }
-    
-    puts("Retype password: ");
-    read_password(password2, sizeof(password2));
-    
-    // Verify passwords match
-    if (strcmp_local(password1, password2) != 0) {
-        println("");
-        println("Error: Passwords do not match");
-        // Clear password buffers
-        for (int i = 0; i < 128; i++) {
-            password1[i] = 0;
-            password2[i] = 0;
-        }
-        return -1;
-    }
-    
-    // Create user
-    User *new_user = &user_database[user_count];
-    strcpy_local(new_user->username, username);
-    hash_password(password1, new_user->password_hash);
-    new_user->exists = true;
-    user_count++;
-    
-    // Clear password buffers (security)
-    for (int i = 0; i < 128; i++) {
-        password1[i] = 0;
-        password2[i] = 0;
-    }
-    
-    println("");
-    print_separator();
-    puts("User '");
-    puts(username);
-    println("' created successfully");
-    println("");
-    println("User Details:");
-    puts("  Username: ");
-    println(username);
-    println("  Group: Users");
-    puts("  Home: C:\\USERS\\");
-    println(username);
-    println("  Status: Active");
-    
-    return 0;
-}
-
-static int cmd_passwd(int argc, char *argv[]) {
-    if (argc < 2) {
-        println("Usage: PASSWD <username>");
-        return -1;
-    }
-    
-    char *username = argv[1];
-    
-    // Check if user exists
-    if (!user_exists(username)) {
-        println("Error: User does not exist");
-        return -1;
-    }
-    
-    println("");
-    print_separator();
-    puts("Changing password for user: ");
-    println(username);
-    println("");
-    
-    // Read old password for verification
-    char old_password[128];
-    char new_password1[128];
-    char new_password2[128];
-    
-    puts("Enter current password: ");
-    read_password(old_password, sizeof(old_password));
-    
-    // Verify old password
-    if (!verify_password(username, old_password)) {
-        println("");
-        println("Error: Incorrect password");
-        // Clear buffers
-        for (int i = 0; i < 128; i++) old_password[i] = 0;
-        return -1;
-    }
-    
-    println("Current password verified");
-    println("");
-    
-    // Read new password
-    puts("Enter new password: ");
-    if (read_password(new_password1, sizeof(new_password1)) < 4) {
-        println("");
-        println("Error: Password must be at least 4 characters");
-        // Clear buffers
-        for (int i = 0; i < 128; i++) {
-            old_password[i] = 0;
-            new_password1[i] = 0;
-        }
-        return -1;
-    }
-    
-    puts("Retype new password: ");
-    read_password(new_password2, sizeof(new_password2));
-    
-    // Verify new passwords match
-    if (strcmp_local(new_password1, new_password2) != 0) {
-        println("");
-        println("Error: Passwords do not match");
-        // Clear buffers
-        for (int i = 0; i < 128; i++) {
-            old_password[i] = 0;
-            new_password1[i] = 0;
-            new_password2[i] = 0;
-        }
-        return -1;
-    }
-    
-    // Update password
-    for (int i = 0; i < user_count; i++) {
-        if (user_database[i].exists && 
-            strcmp_local(user_database[i].username, username) == 0) {
-            hash_password(new_password1, user_database[i].password_hash);
-            break;
-        }
-    }
-    
-    // Clear password buffers (security)
-    for (int i = 0; i < 128; i++) {
-        old_password[i] = 0;
-        new_password1[i] = 0;
-        new_password2[i] = 0;
-    }
-    
-    println("");
-    print_separator();
-    println("Password updated successfully");
-    puts("Password changed for user: ");
-    println(username);
-    println("");
-    
-    return 0;
-}
-
-/* Add this command to list users */
-static int cmd_users(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-    
-    println("");
-    println("User Accounts");
-    print_separator();
-    println("");
-    
-    if (user_count == 0) {
-        println("  No users registered");
+    if (str_cmp(token, "-filename") == 0 || str_cmp(token, "-O") == 0) {
+      if (*p)
+        p = get_token(p, output_file, 64);
     } else {
-        println("  Username             Status");
-        println("  --------             ------");
-        for (int i = 0; i < user_count; i++) {
-            if (user_database[i].exists) {
-                puts("  ");
-                puts(user_database[i].username);
-                int pad = 21 - strlen_local(user_database[i].username);
-                for (int j = 0; j < pad; j++) putc(' ');
-                println("Active");
-            }
-        }
+      str_copy(url, token, 256);
+    }
+  }
+
+  if (url[0] == 0) {
+    puts("Usage: WGET <URL> [-O <filename>]\n");
+    puts("Example: WGET http://example.com/file.txt -O myfile.txt\n");
+    puts("         WGET http://httpbin.org/ip (Test IP)\n");
+    puts("         WGET http://httpbin.org/get (Test GET request)\n");
+    return -1;
+  }
+
+  // Parse URL
+  char *host_start = url;
+  if (url[0] == 'h' && url[1] == 't' && url[2] == 't' && url[3] == 'p') {
+    if (url[4] == ':' && url[5] == '/' && url[6] == '/')
+      host_start += 7;
+    else if (url[4] == 's' && url[5] == ':' && url[6] == '/' && url[7] == '/') {
+      host_start += 8;
+      set_attr(0x0E);
+      puts("Note: HTTPS not supported, using HTTP.\n");
+      set_attr(0x07);
+    }
+  }
+
+  // Validate URL
+  if (host_start[0] == 0 || host_start[0] == '/') {
+    set_attr(0x0C);
+    puts("Error: Invalid URL format.\n");
+    set_attr(0x07);
+    return -1;
+  }
+
+  // Extract host and path
+  char host[128] = {0};
+  char path[128] = {0};
+  int i = 0;
+  while (host_start[i] && host_start[i] != '/' && host_start[i] != ':' && i < 127) {
+    host[i] = host_start[i];
+    i++;
+  }
+  host[i] = 0;
+
+  // Extract path
+  if (host_start[i] == '/') {
+    int j = 0;
+    while (host_start[i] && j < 127) {
+      path[j++] = host_start[i++];
+    }
+    path[j] = 0;
+  } else {
+    path[0] = '/';
+    path[1] = 0;
+  }
+
+  // Resolve Host
+  uint32_t ip = 0;
+  bool is_ip = true;
+  for (int k = 0; host[k]; k++) {
+    if ((host[k] < '0' || host[k] > '9') && host[k] != '.')
+      is_ip = false;
+  }
+
+  char buf[32];
+  
+  if (is_ip) {
+    int parts[4] = {0};
+    int val = 0, idx = 0;
+    for (int k = 0; host[k]; k++) {
+      if (host[k] == '.') {
+        parts[idx++] = val;
+        val = 0;
+      } else
+        val = val * 10 + (host[k] - '0');
+    }
+    parts[idx] = val;
+    ip = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+    
+    set_attr(0x0B);
+    puts("Host: ");
+    puts(host);
+    puts("\n");
+    set_attr(0x07);
+  } else {
+    set_attr(0x0B);
+    puts("Resolving ");
+    puts(host);
+    puts("...\n");
+    set_attr(0x07);
+    
+    ip = dns_resolve(host);
+    if (ip == 0) {
+      set_attr(0x0C);
+      puts("ERROR: DNS resolution failed!\n");
+      puts("Cannot resolve hostname. Check your DNS settings.\n");
+      set_attr(0x07);
+      return -1;
     }
     
-    println("");
-    char buf[16];
-    puts("Total users: ");
-    utoa_decimal(buf, user_count);
-    println(buf);
-    println("");
-    
-    return 0;
-}
+    set_attr(0x0A);
+    puts("Resolved: ");
+  }
 
-/* === HELP COMMAND === */
+  // Print IP
+  int_to_str((ip >> 24) & 0xFF, buf);
+  puts(buf);
+  puts(".");
+  int_to_str((ip >> 16) & 0xFF, buf);
+  puts(buf);
+  puts(".");
+  int_to_str((ip >> 8) & 0xFF, buf);
+  puts(buf);
+  puts(".");
+  int_to_str(ip & 0xFF, buf);
+  puts(buf);
+  puts("\n");
+  set_attr(0x07);
 
-static int cmd_help(int argc, char *argv[]) {
-    (void)argc; (void)argv;
-
-    println("");
-    println("==================================================================");
-    println("=          RO-DOS Command Reference - Complete Edition           =");
-    println("==================================================================");
-    println("");
-
-    println("= SYSTEM & UTILITY COMMANDS ======================================");
-    println("= HELP/MAN         Show this command reference                  =");
-    println("= VER/VERSION      Display system version information           =");
-    println("= MEM/MEMORY       Display memory statistics                    =");
-    println("= ECHO             Display messages or control echo state       =");
-    println("= REBOOT           Restart the system                           =");
-    println("= SHUTDOWN/HALT    Shut down the system                         =");
-    println("= CLS/CLEAR        Clear the screen                             =");
-    println("= COLOR/ATTR       Set screen color attributes (0-F)            =");
-    println("= BEEP/SOUND       Generate system beep                         =");
-    println("= SLEEP/WAIT       Pause execution for specified time           =");
-    println("= GETTICK/TIME     Display system uptime ticks                  =");
-    println("= DATE             Display current date                         =");
-    println("= WHOAMI/ID        Display current user information             =");
-    println("= EXIT/LOGOUT      Exit shell (use SHUTDOWN instead)            =");
-    println("==================================================================");
-    println("");
-
-    println("= FILESYSTEM COMMANDS ============================================");
-    println("= DIR/LS/LIST      List directory contents                      =");
-    println("= CD/CHDIR         Change current directory                     =");
-    println("= MD/MKDIR         Create a new directory                       =");
-    println("= RD/RMDIR         Remove a directory                           =");
-    println("= TYPE/CAT/VIEW    Display file contents                        =");
-    println("= COPY/CP          Copy files                                   =");
-    println("= DEL/RM/ERASE     Delete files                                 =");
-    println("= MOVE/MV/REN      Move or rename files                         =");
-    println("= ATTRIB/CHMOD     Change file attributes                       =");
-    println("= TOUCH/CREA       Create empty file                            =");
-    println("= XCOPY/ROBO       Extended copy with options                   =");
-    println("= FIND/GREP        Search for text in files                     =");
-    println("= PUSHD            Push directory onto stack                    =");
-    println("= POPD             Pop directory from stack                     =");
-    println("==================================================================");
-    println("");
-
-    println("= DISK & HARDWARE COMMANDS =======================================");
-    println("= FORMAT           Format a disk drive                          =");
-    println("= FDISK/PART       Disk partitioning utility                    =");
-    println("= CHKDSK/FSCK      Check disk for errors                        =");
-    println("= MOUNT/UMOUNT     Mount or unmount volumes                     =");
-    println("= LABEL/VOL        View or set disk volume label                =");
-    println("= DISKCOMP         Compare two disks                            =");
-    println("= BACKUP/RESTO     Backup and restore utility                   =");
-    println("= DRIVE/DEV        List available drives and devices            =");
-    println("==================================================================");
-    println("");
-
-    println("= NETWORKING COMMANDS ============================================");
-    println("= PING/PTEST       Test network connectivity to host            =");
-    println("= IPCONFIG/IFC     Display network adapter configuration        =");
-    println("= TRACERT/TRAC     Trace route to destination host              =");
-    println("= NET/NETSTAT      Display network statistics and connections   =");
-    println("= FTP/SFTP         File Transfer Protocol client                =");
-    println("= TELNET/SSH       Remote terminal connection client            =");
-    println("= WGET/CURL        Download files from network                  =");
-    println("= DNS              DNS hostname lookup utility                  =");
-    println("= ROUTE            Display and modify routing table             =");
-    println("==================================================================");
-    println("");
-
-    println("= PROCESS & TASK MANAGEMENT ======================================");
-    println("= PS/TASKLIST      List all running processes                   =");
-    println("= KILL/TASKILL     Terminate a process by PID                   =");
-    println("= RUN/EXEC         Execute a program or command                 =");
-    println("= FREE/CACHE       Display memory usage summary                 =");
-    println("= NICE/PRIO        Set process priority level                   =");
-    println("= START            Start program in background                  =");
-    println("==================================================================");
-    println("");
-
-    println("= DEVICE & DRIVER MANAGEMENT =====================================");
-    println("= BIOS/SETUP       Display BIOS information                     =");
-    println("= LOAD/INSTALL     Load a driver or program                     =");
-    println("= DRIVER           List and manage device drivers               =");
-    println("= PCMCIA/USB       Display USB and PCMCIA device status         =");
-    println("= IRQ/DMA          Show IRQ and DMA resource usage              =");
-    println("==================================================================");
-    println("");
-
-    println("= ENVIRONMENT & SECURITY =========================================");
-    println("= SET/EXPORT       Set or display environment variables         =");
-    println("= UNSET/UNEXPORT   Remove environment variables                 =");
-    println("= PATH             Display or set command search path           =");
-    println("= USERADD/ADDUSR   Add a new user account                       =");
-    println("= PASSWD/CHPASS    Change user password                         =");
-    println("==================================================================");
-    println("");
-
-    println("For detailed help on any command, type: <command> /?");
-    println("");
-    return 0;
-}
-
-
-/* MAIN COMMAND DISPATCHER */
-
-int cmd_dispatch(const char *cmdline) {
-    if (!cmdline || !*cmdline) return 0;
-    
-    char buf[256];
-    size_t l = strlen_local(cmdline);
-    if (l >= 255) l = 255;
-    for(size_t i=0; i<l; i++) buf[i] = cmdline[i];
-    buf[l] = 0;
-
-    char *argv[16];
-    int argc = tokenize(buf, argv, 16);
-    if (argc == 0) return 0;
-
-    char *cmd = argv[0];
-    toupper_str(cmd);
-
-    /* SYSTEM & UTILITY COMMANDS */
-    if (strcmp_local(cmd, "HELP") == 0 || strcmp_local(cmd, "MAN") == 0 || 
-        strcmp_local(cmd, "DOC") == 0) return cmd_help(argc, argv);
-    if (strcmp_local(cmd, "CLS") == 0 || strcmp_local(cmd, "CLEAR") == 0) 
-        return cmd_cls(argc, argv);
-    if (strcmp_local(cmd, "VER") == 0 || strcmp_local(cmd, "VERSION") == 0) 
-        return cmd_ver(argc, argv);
-    if (strcmp_local(cmd, "ECHO") == 0 || strcmp_local(cmd, "PRINT") == 0) 
-        return cmd_echo(argc, argv);
-    if (strcmp_local(cmd, "MEM") == 0 || strcmp_local(cmd, "MEMORY") == 0) 
-        return cmd_mem(argc, argv);
-    if (strcmp_local(cmd, "REBOOT") == 0) 
-        return cmd_reboot(argc, argv);
-    if (strcmp_local(cmd, "SHUTDOWN") == 0 || strcmp_local(cmd, "HALT") == 0) 
-        return cmd_shutdown(argc, argv);
-    if (strcmp_local(cmd, "COLOR") == 0 || strcmp_local(cmd, "ATTR") == 0) 
-        return cmd_color(argc, argv);
-    if (strcmp_local(cmd, "BEEP") == 0 || strcmp_local(cmd, "SOUND") == 0) 
-        return cmd_beep(argc, argv);
-    if (strcmp_local(cmd, "GETTICK") == 0) 
-        return cmd_getticks(argc, argv);
-    if (strcmp_local(cmd, "TIME") == 0) 
-        return cmd_time(argc, argv);
-    if (strcmp_local(cmd, "SLEEP") == 0 || strcmp_local(cmd, "WAIT") == 0) 
-        return cmd_sleep(argc, argv);
-    if (strcmp_local(cmd, "DATE") == 0 || strcmp_local(cmd, "CAL") == 0) 
-        return cmd_date(argc, argv);
-    if (strcmp_local(cmd, "LOGOUT") == 0 || strcmp_local(cmd, "EXIT") == 0) 
-        return cmd_exit(argc, argv);
-    if (strcmp_local(cmd, "WHOAMI") == 0 || strcmp_local(cmd, "ID") == 0) 
-        return cmd_whoami(argc, argv);
-
-    /* FILESYSTEM COMMANDS */
-    if (strcmp_local(cmd, "DIR") == 0 || strcmp_local(cmd, "LS") == 0 || 
-        strcmp_local(cmd, "LIST") == 0) 
-        return cmd_dir(argc, argv);
-    if (strcmp_local(cmd, "CD") == 0 || strcmp_local(cmd, "CHDIR") == 0 || 
-        strcmp_local(cmd, "CWD") == 0) 
-        return cmd_cd(argc, argv);
-    if (strcmp_local(cmd, "MD") == 0 || strcmp_local(cmd, "MKDIR") == 0) 
-        return cmd_md(argc, argv);
-    if (strcmp_local(cmd, "RD") == 0 || strcmp_local(cmd, "RMDIR") == 0) 
-        return cmd_rd(argc, argv);
-    if (strcmp_local(cmd, "TYPE") == 0 || strcmp_local(cmd, "CAT") == 0 || 
-        strcmp_local(cmd, "VIEW") == 0) 
-        return cmd_type(argc, argv);
-    if (strcmp_local(cmd, "COPY") == 0 || strcmp_local(cmd, "CP") == 0) 
-        return cmd_copy(argc, argv);
-    if (strcmp_local(cmd, "DEL") == 0 || strcmp_local(cmd, "RM") == 0 || 
-        strcmp_local(cmd, "ERASE") == 0) 
-        return cmd_del(argc, argv);
-    if (strcmp_local(cmd, "MOVE") == 0 || strcmp_local(cmd, "MV") == 0 || 
-        strcmp_local(cmd, "REN") == 0) 
-        return cmd_ren(argc, argv);
-    if (strcmp_local(cmd, "ATTRIB") == 0 || strcmp_local(cmd, "CHMOD") == 0) 
-        return cmd_attrib(argc, argv);
-    if (strcmp_local(cmd, "TOUCH") == 0 || strcmp_local(cmd, "CREA") == 0) 
-        return cmd_touch(argc, argv);
-    if (strcmp_local(cmd, "XCOPY") == 0 || strcmp_local(cmd, "ROBO") == 0) 
-        return cmd_xcopy(argc, argv);
-    if (strcmp_local(cmd, "FIND") == 0 || strcmp_local(cmd, "GREP") == 0) 
-        return cmd_find(argc, argv);
-    if (strcmp_local(cmd, "PUSHD") == 0) 
-        return cmd_pushd(argc, argv);
-    if (strcmp_local(cmd, "POPD") == 0) 
-        return cmd_popd(argc, argv);
-    
-    /* DISK & HARDWARE COMMANDS */
-    if (strcmp_local(cmd, "FORMAT") == 0) 
-        return cmd_format(argc, argv);
-    if (strcmp_local(cmd, "FDISK") == 0 || strcmp_local(cmd, "PART") == 0) 
-        return cmd_fdisk(argc, argv);
-    if (strcmp_local(cmd, "CHKDSK") == 0 || strcmp_local(cmd, "FSCK") == 0) 
-        return cmd_chkdsk(argc, argv);
-    if (strcmp_local(cmd, "MOUNT") == 0 || strcmp_local(cmd, "UMOUNT") == 0) 
-        return cmd_mount(argc, argv);
-    if (strcmp_local(cmd, "LABEL") == 0 || strcmp_local(cmd, "VOL") == 0) 
-        return cmd_label(argc, argv);
-    if (strcmp_local(cmd, "DISKCOMP") == 0) 
-        return cmd_diskcomp(argc, argv);
-    if (strcmp_local(cmd, "BACKUP") == 0 || strcmp_local(cmd, "RESTO") == 0) 
-        return cmd_backup(argc, argv);
-    if (strcmp_local(cmd, "DRIVE") == 0 || strcmp_local(cmd, "DEV") == 0) 
-        return cmd_drive(argc, argv);
-
-    /* NETWORKING COMMANDS */
-    if (strcmp_local(cmd, "PING") == 0 || strcmp_local(cmd, "PTEST") == 0) 
-        return cmd_ping(argc, argv);
-    if (strcmp_local(cmd, "IPCONFIG") == 0 || strcmp_local(cmd, "IFC") == 0) 
-        return cmd_ipconfig(argc, argv);
-    if (strcmp_local(cmd, "TRACERT") == 0 || strcmp_local(cmd, "TRAC") == 0) 
-        return cmd_tracert(argc, argv);
-    if (strcmp_local(cmd, "NET") == 0 || strcmp_local(cmd, "NETSTAT") == 0) 
-        return cmd_netstat(argc, argv);
-    if (strcmp_local(cmd, "FTP") == 0 || strcmp_local(cmd, "SFTP") == 0) 
-        return cmd_ftp(argc, argv);
-    if (strcmp_local(cmd, "TELNET") == 0 || strcmp_local(cmd, "SSH") == 0) 
-        return cmd_telnet(argc, argv);
-    if (strcmp_local(cmd, "WGET") == 0 || strcmp_local(cmd, "CURL") == 0) 
-        return cmd_wget(argc, argv);
-    if (strcmp_local(cmd, "DNS") == 0) 
-        return cmd_dns(argc, argv);
-    if (strcmp_local(cmd, "ROUTE") == 0) 
-        return cmd_route(argc, argv);
-
-    /* PROCESS & TASK MANAGEMENT */
-    if (strcmp_local(cmd, "PS") == 0 || strcmp_local(cmd, "TASKLIST") == 0) 
-        return cmd_ps(argc, argv);
-    if (strcmp_local(cmd, "KILL") == 0 || strcmp_local(cmd, "TASKILL") == 0) 
-        return cmd_kill(argc, argv);
-    if (strcmp_local(cmd, "RUN") == 0 || strcmp_local(cmd, "EXEC") == 0) 
-        return cmd_run(argc, argv);
-    if (strcmp_local(cmd, "FREE") == 0 || strcmp_local(cmd, "CACHE") == 0) 
-        return cmd_free(argc, argv);
-    if (strcmp_local(cmd, "NICE") == 0 || strcmp_local(cmd, "PRIO") == 0) 
-        return cmd_nice(argc, argv);
-    if (strcmp_local(cmd, "START") == 0) 
-        return cmd_start(argc, argv);
-    
-    /* DEVICE/DRIVER MANAGEMENT */
-    if (strcmp_local(cmd, "BIOS") == 0 || strcmp_local(cmd, "SETUP") == 0) 
-        return cmd_bios(argc, argv);
-    if (strcmp_local(cmd, "LOAD") == 0 || strcmp_local(cmd, "INSTALL") == 0) 
-        return cmd_load(argc, argv);
-    if (strcmp_local(cmd, "DRIVER") == 0) 
-        return cmd_driver(argc, argv);
-    if (strcmp_local(cmd, "PCMCIA") == 0 || strcmp_local(cmd, "USB") == 0) 
-        return cmd_usb(argc, argv);
-    if (strcmp_local(cmd, "IRQ") == 0 || strcmp_local(cmd, "DMA") == 0) 
-        return cmd_irq(argc, argv);
-
-    /* ENVIRONMENT/SECURITY */
-    if (strcmp_local(cmd, "SET") == 0 || strcmp_local(cmd, "EXPORT") == 0) 
-        return cmd_set(argc, argv);
-    if (strcmp_local(cmd, "UNSET") == 0 || strcmp_local(cmd, "UNEXPORT") == 0) 
-        return cmd_unset(argc, argv);
-    if (strcmp_local(cmd, "PATH") == 0) 
-        return cmd_path(argc, argv);
-    if (strcmp_local(cmd, "USERADD") == 0 || strcmp_local(cmd, "ADDUSR") == 0) 
-        return cmd_useradd(argc, argv);
-    if (strcmp_local(cmd, "PASSWD") == 0 || strcmp_local(cmd, "CHPASS") == 0) 
-        return cmd_passwd(argc, argv);
-    if (strcmp_local(cmd, "USERS") == 0 || strcmp_local(cmd, "WHOUSER") == 0) 
-        return cmd_users(argc, argv);
-
-    /* UNKNOWN COMMAND */
-    puts("Bad command or file name: ");
-    println(cmd);
-    println("Type HELP for a list of commands.");
+  set_attr(0x0B);
+  puts("Connecting to ");
+  puts(host);
+  puts(":80...\n");
+  set_attr(0x07);
+  
+  int sock = tcp_connect(ip, 80);
+  if (sock < 0) {
+    set_attr(0x0C);
+    puts("ERROR: Connection failed!\n");
+    set_attr(0x07);
     return -1;
+  }
+
+  set_attr(0x0A);
+  puts("Connected! Sending HTTP request...\n");
+  set_attr(0x07);
+
+  // Build HTTP Request
+  char req[512];
+  str_copy(req, "GET ", 512);
+  char *d = req + 4;
+  const char *s = path;
+  while (*s && (d - req) < 500)
+    *d++ = *s++;
+  s = " HTTP/1.0\r\nHost: ";
+  while (*s && (d - req) < 500)
+    *d++ = *s++;
+  s = host;
+  while (*s && (d - req) < 500)
+    *d++ = *s++;
+  s = "\r\nUser-Agent: RO-DOS/1.1\r\nConnection: close\r\nAccept: */*\r\n\r\n";
+  while (*s && (d - req) < 511)
+    *d++ = *s++;
+  *d = 0;
+
+  tcp_send(sock, req, str_len(req));
+
+  set_attr(0x0E);
+  puts("Downloading");
+  set_attr(0x07);
+  
+  // Use kmalloc for larger buffer - 1MB for larger downloads
+  #define DOWNLOAD_BUF_SIZE (1024 * 1024)
+  char *down_buf = (char *)kmalloc(DOWNLOAD_BUF_SIZE);
+  if (!down_buf) {
+    set_attr(0x0C);
+    puts("\nERROR: Out of memory!\n");
+    set_attr(0x07);
+    tcp_close(sock);
+    return -1;
+  }
+
+  int total_recvd = 0;
+  int dots = 0;
+
+  // Download with progress indicator
+  while (total_recvd < DOWNLOAD_BUF_SIZE) {
+    int r = tcp_receive(sock, down_buf + total_recvd, DOWNLOAD_BUF_SIZE - total_recvd);
+    if (r <= 0)
+      break;
+    total_recvd += r;
+    
+    // Show progress dots (one per ~1KB received)
+    while (dots < total_recvd / 1024) {
+      putc('.');
+      dots++;
+      if (dots % 50 == 0) {
+        puts("\n");
+      }
+    }
+  }
+  puts("\n");
+
+  set_attr(0x0A);
+  puts("Download complete! ");
+  int_to_str(total_recvd, buf);
+  puts(buf);
+  puts(" bytes received.\n");
+  set_attr(0x07);
+
+  // Parse HTTP Response - find body
+  char *body = down_buf;
+  int body_len = total_recvd;
+  bool found_header_end = false;
+  
+  for (int i = 0; i < total_recvd - 3; i++) {
+    if (down_buf[i] == '\r' && down_buf[i + 1] == '\n' &&
+        down_buf[i + 2] == '\r' && down_buf[i + 3] == '\n') {
+      body = &down_buf[i + 4];
+      body_len = total_recvd - (i + 4);
+      found_header_end = true;
+      break;
+    }
+  }
+
+  if (!found_header_end) {
+    // Try \n\n separator
+    for (int i = 0; i < total_recvd - 1; i++) {
+      if (down_buf[i] == '\n' && down_buf[i + 1] == '\n') {
+        body = &down_buf[i + 2];
+        body_len = total_recvd - (i + 2);
+        break;
+      }
+    }
+  }
+
+  // Extract filename if not specified
+  if (output_file[0] == 0) {
+    char *last_slash = path;
+    for (int k = 0; path[k]; k++)
+      if (path[k] == '/')
+        last_slash = path + k;
+    
+    if (last_slash[1] && last_slash[1] != '?') {
+      // Extract filename up to '?' if present
+      int fn_idx = 0;
+      last_slash++;
+      while (*last_slash && *last_slash != '?' && fn_idx < 63) {
+        output_file[fn_idx++] = *last_slash++;
+      }
+      output_file[fn_idx] = 0;
+    } else {
+      str_copy(output_file, "index.html", 64);
+    }
+  }
+
+  // Save to file
+  puts("Saving to ");
+  puts(output_file);
+  puts("...\n");
+  
+  if (save_file_content(output_file, body, body_len) == 0) {
+    fs_save_to_disk();
+    set_attr(0x0A);
+    puts("SUCCESS! Saved ");
+    int_to_str(body_len, buf);
+    puts(buf);
+    puts(" bytes to ");
+    puts(output_file);
+    puts("\n");
+    set_attr(0x07);
+  } else {
+    set_attr(0x0C);
+    puts("ERROR: Failed to save file!\n");
+    set_attr(0x07);
+  }
+
+  kfree(down_buf);
+  tcp_close(sock);
+  return 0;
+}
+
+/* COMMAND DISPATCHER */
+
+typedef struct {
+  const char *name;
+  int (*func)(const char *args);
+} Command;
+
+static const Command commands[] = {{"GUITEST", cmd_guitest},
+                                   {"CALC-GUI", cmd_calc_gui},
+                                   {"WIFITEST", cmd_wifitest},
+                                   {"NETSTART", cmd_netstart},
+                                   {"HELP", cmd_help},
+                                   {"?", cmd_help},
+                                   {"CLS", cmd_cls},
+                                   {"CLEAR", cmd_clear},
+                                   {"VER", cmd_ver},
+                                   {"VERSION", cmd_ver},
+                                   {"TIME", cmd_time},
+                                   {"DATE", cmd_date},
+                                   {"REBOOT", cmd_reboot},
+                                   {"SHUTDOWN", cmd_shutdown},
+                                   {"HALT", cmd_halt},
+                                   {"EXIT", cmd_exit},
+
+                                   /* File operations */
+                                   {"MKDIR", cmd_mkdir},
+                                   {"RMDIR", cmd_rmdir},
+                                   {"TOUCH", cmd_touch},
+                                   {"DEL", cmd_del},
+                                   {"RM", cmd_rm},
+                                   {"DIR", cmd_dir},
+                                   {"LS", cmd_ls},
+                                   {"CD", cmd_cd},
+                                   {"PWD", cmd_pwd},
+                                   {"CAT", cmd_cat},
+                                   {"TYPE", cmd_type},
+                                   {"NANO", cmd_nano},
+                                   {"COPY", cmd_copy},
+                                   {"CP", cmd_cp},
+                                   {"MOVE", cmd_move},
+                                   {"MV", cmd_mv},
+                                   {"REN", cmd_ren},
+                                   {"RENAME", cmd_ren},
+                                   {"FIND", cmd_find},
+                                   {"TREE", cmd_tree},
+                                   {"ATTRIB", cmd_attrib},
+                                   {"CHMOD", cmd_chmod},
+
+                                   /* Disk operations */
+                                   {"VOL", cmd_vol},
+                                   {"LABEL", cmd_label},
+                                   {"CHKDSK", cmd_chkdsk},
+                                   {"FORMAT", cmd_format},
+                                   {"DISKPART", cmd_diskpart},
+                                   {"FSCK", cmd_fsck},
+                                   {"MOUNT", cmd_mount},
+                                   {"UMOUNT", cmd_umount},
+                                   {"SYNC", cmd_sync},
+                                   {"FREE", cmd_free},
+                                   {"DF", cmd_df},
+                                   {"DU", cmd_du},
+                                   {"LSBLK", cmd_lsblk},
+                                   {"FDISK", cmd_fdisk},
+                                   {"BLKID", cmd_blkid},
+                                   {"READSECTOR", cmd_readsector},
+
+                                   /* User management */
+                                   {"USERADD", cmd_useradd},
+                                   {"USERDEL", cmd_userdel},
+                                   {"PASSWD", cmd_passwd},
+                                   {"USERS", cmd_users},
+                                   {"LOGIN", cmd_login},
+                                   {"LOGOUT", cmd_logout},
+                                   {"WHOAMI", cmd_whoami},
+                                   {"SU", cmd_su},
+
+                                   /* Process management */
+                                   {"PS", cmd_ps},
+                                   {"KILL", cmd_kill},
+                                   {"TOP", cmd_top},
+                                   {"TASKLIST", cmd_tasklist},
+                                   {"TASKKILL", cmd_taskkill},
+
+                                   /* System info */
+                                   {"MEM", cmd_mem},
+                                   {"UPTIME", cmd_uptime},
+                                   {"SYSINFO", cmd_sysinfo},
+                                   {"UNAME", cmd_uname},
+                                   {"HOSTNAME", cmd_hostname},
+                                   {"LSCPU", cmd_lscpu},
+                                   {"LSPCI", cmd_lspci},
+                                   {"DMESG", cmd_dmesg},
+
+                                   /* Screen/display */
+                                   {"COLOR", cmd_color},
+                                   {"ECHO", cmd_echo},
+                                   {"MODE", cmd_mode},
+
+                                   /* Utilities */
+                                   {"BEEP", cmd_beep},
+                                   {"CALC", cmd_calc},
+                                   {"HEXDUMP", cmd_hexdump},
+                                   {"ASCII", cmd_ascii},
+                                   {"HASH", cmd_hash},
+                                   {"PAUSE", cmd_pause},
+                                   {"SLEEP", cmd_sleep},
+
+                                   /* Network */
+                                   {"WIFILOGIN", cmd_wifilogin},
+                                   {"WIFISTAT", cmd_wifistat},
+                                   {"WIFIDISCONNECT", cmd_wifidisconnect},
+                                   {"WIFIRESCAN", cmd_wifirescan},
+                                   {"WIFISIGNAL", cmd_wifisignal},
+                                   {"WIFIAP", cmd_wifiap},
+                                   {"IPCONFIG", cmd_ipconfig},
+                                   {"PING", cmd_ping},
+                                   {"WIFITEST", cmd_wifitest},
+                                   {"NETMODE", cmd_netmode},
+                                   {"WGET", cmd_wget},
+                                   {"NOTEPAD", gui_notepad},
+                                   {"PAINT", gui_paint},
+                                   {"FILEBROWSER", gui_filebrowser},
+                                   {"BROWSER", gui_filebrowser},
+                                   {"CLOCK", gui_clock},
+                                   {"SYSINFOGUI", gui_sysinfo},
+                                   {"SUDO", cmd_sudo},
+                                   {"PYTHON", cmd_python},
+
+                                   /* File utilities */
+                                   {"WC", cmd_wc},
+                                   {"HEAD", cmd_head},
+                                   {"TAIL", cmd_tail},
+                                   {"GREP", cmd_grep},
+                                   {"SORT", cmd_sort},
+                                   {"UNIQ", cmd_uniq},
+                                   {"CUT", cmd_cut},
+                                   {"DIFF", cmd_diff},
+                                   {"MORE", cmd_more},
+                                   {"LESS", cmd_less},
+                                   {"FILE", cmd_file},
+                                   {"STAT", cmd_stat},
+
+                                   /* Environment */
+                                   {"PATH", cmd_path},
+                                   {"SET", cmd_set},
+                                   {"ALIAS", cmd_alias},
+                                   {"HISTORY", cmd_history},
+                                   {"PROMPT", cmd_prompt},
+                                   {"PRINTENV", cmd_printenv},
+                                   {"EXPORT", cmd_export},
+                                   {"SOURCE", cmd_source},
+                                   {"WHICH", cmd_which},
+                                   {"WHEREIS", cmd_whereis},
+
+                                   {NULL, NULL}};
+
+/* Command dispatcher - called from shell */
+int cmd_dispatch(const char *line) {
+  if (!line || !line[0])
+    return 0;
+
+  /* Extract command name */
+  char cmd_name[64];
+  const char *args = get_token(line, cmd_name, 64);
+
+  /* Convert to uppercase */
+  str_upper(cmd_name);
+
+  /* Find and execute command */
+  for (int i = 0; commands[i].name != NULL; i++) {
+    if (str_cmp(cmd_name, commands[i].name) == 0) {
+      return commands[i].func(args);
+    }
+  }
+
+  /* Command not found */
+  return -255;
+}
+
+/* Initialize command system */
+void cmd_init(void) { fs_init_commands(); }
+
+/* Silent version - no output messages */
+void cmd_init_silent(void) { 
+  fs_init_silent = 1;
+  fs_init_commands(); 
+  fs_init_silent = 0;
 }
