@@ -28,6 +28,9 @@ global puts
 global cls
 global io_set_attr
 global set_cursor_pos
+global set_cursor_hardware
+global cursor_row
+global cursor_col
 
 ; Hardware Cursor Update
 set_cursor_hardware:
@@ -73,7 +76,7 @@ io_init:
 cls:
     pusha
     mov edi, [video_base]
-    mov ecx, 2000
+    mov ecx, 2000  ; 80x25 = 2000 characters
     mov ah, [default_attr]
     mov al, ' '
     rep stosw
@@ -86,14 +89,19 @@ cls:
 ; Scroll Up
 scroll_up:
     pusha
+    
+    ; Capture top line to scrollback before scrolling
+    extern scrollback_capture_line
+    call scrollback_capture_line
+    
     mov edi, [video_base]
     mov esi, [video_base]
-    add esi, 160
-    mov ecx, 1920
+    add esi, 160  ; One line = 80 chars * 2 bytes = 160
+    mov ecx, 1920  ; 24 lines * 80 = 1920
     rep movsw
     
     mov edi, [video_base]
-    add edi, 3840
+    add edi, 3840  ; 24 lines * 160 bytes = 3840
     mov ecx, 80
     mov ah, [default_attr]
     mov al, ' '
