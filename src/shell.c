@@ -7,8 +7,31 @@ extern void c_putc(char c);
 extern uint16_t c_getkey(void);
 extern void set_attr(uint8_t a);
 extern int cmd_dispatch(const char *cmd);
+extern void cmd_init(void);
+extern void cmd_init_silent(void);  /* Silent version for GUI restore */
+extern int netif_init(void);  /* Network interface initialization */
+extern char current_dir[256];  /* Get current directory from commands.c */
+extern void wifi_autostart(void);  /* WiFi auto-initialization */
+
+/* Cursor and scrollback */
+extern void cursor_init(void);
+extern void cursor_set_style(uint8_t style);
+
+// Scrollback functions - disabled temporarily to prevent crashes
+// extern void scrollback_scroll_up(void);
+// extern void scrollback_scroll_down(void);
+// extern void scrollback_reset(void);
+// extern bool scrollback_is_active(void);
+
+/* GUI screen restore after reboot */
+extern int gui_check_and_restore_screen(void);
 
 #define MAX_INPUT 256
+#define HISTORY_SIZE 20
+
+static char history[HISTORY_SIZE][MAX_INPUT];
+static int history_count = 0;
+static int history_pos = 0;
 
 static size_t str_len(const char *s) {
     size_t l = 0;
@@ -23,17 +46,53 @@ static void str_trim(char *s) {
     }
 }
 
+static void strupr(char *s) {
+    while (*s) {
+        if (*s >= 'a' && *s <= 'z')
+            *s -= 32;
+        s++;
+    }
+}
+
 void shell_main(void) {
     char line[MAX_INPUT];
     int pos = 0;
 
     set_attr(0x07);
-    c_puts("\nRO-DOS v1.0\n");
+    
+    /* Check if we're returning from GUI via reboot - restore screen if so */
+    if (gui_check_and_restore_screen()) {
+        /* Screen was restored from GUI exit, skip boot messages */
+        /* Just initialize the systems silently - no output! */
+        cmd_init_silent();
+        /* Skip netif_init too as it may print messages */
+        /* Print newline after the restored "guitest" line, then go to prompt */
+        c_putc('\n');
+        /* Go straight to command prompt */
+        goto prompt_loop;
+    }
+    
+    /* Initialize custom cursor - DISABLED */
+    // cursor_init();
+    // cursor_set_style(0); // Block cursor
+    
 
+    
+    /* Initialize command system and filesystem */
+    cmd_init();
+    
+    /* Initialize network interface subsystem */
+    netif_init();
+    
+    /* Auto-detect and initialize WiFi hardware */
+    wifi_autostart();
+
+prompt_loop:
     while (1) {
         set_attr(0x0E); // Yellow prompt
-        c_puts("C:> ");
-        set_attr(0x0F); // White input
+        c_puts(current_dir);
+        c_puts("> ");
+        set_attr(0x07); // Gray/white input
         
         pos = 0;
         for (int i = 0; i < MAX_INPUT; i++) line[i] = 0;
@@ -41,12 +100,77 @@ void shell_main(void) {
         while (1) {
             uint16_t k = c_getkey();
             uint8_t key = (uint8_t)(k & 0xFF);
+            uint8_t scan = (uint8_t)((k >> 8) & 0xFF);
+            
+            // Handle arrow keys for command history
+            if (key == 0) { // Special key (scan code only)
+                if (scan == 0x48) { // Up arrow
+                    if (history_count > 0) {
+                        // Clear current line
+                        while (pos > 0) {
+                            c_putc(8); c_putc(' '); c_putc(8);
+                            pos--;
+                        }
+                        
+                        // Move back in history
+                        if (history_pos > 0) {
+                            history_pos--;
+                        }
+                        
+                        // Copy from history
+                        int i = 0;
+                        while (history[history_pos][i] && i < MAX_INPUT - 1) {
+                            line[i] = history[history_pos][i];
+                            c_putc(line[i]);
+                            i++;
+                        }
+                        line[i] = '\0';
+                        pos = i;
+                    }
+                    continue;
+                }
+                
+                if (scan == 0x50) { // Down arrow
+                    if (history_count > 0 && history_pos < history_count - 1) {
+                        // Clear current line
+                        while (pos > 0) {
+                            c_putc(8); c_putc(' '); c_putc(8);
+                            pos--;
+                        }
+                        
+                        // Move forward in history
+                        history_pos++;
+                        
+                        // Copy from history
+                        int i = 0;
+                        while (history[history_pos][i] && i < MAX_INPUT - 1) {
+                            line[i] = history[history_pos][i];
+                            c_putc(line[i]);
+                            i++;
+                        }
+                        line[i] = '\0';
+                        pos = i;
+                    }
+                    continue;
+                }
+                
+                // Ignore other special keys for now
+                if (scan == 0x49 || scan == 0x51) { // Page Up/Down
+                    // TODO: Add scrollback buffer support
+                    continue;
+                }
+            }
 
             if (key == 13 || key == 10) { 
                 line[pos] = '\0';
                 c_putc('\n');
                 break;
-            } 
+            }
+            else if (key == 3) {  /* Ctrl+C */
+                c_puts("^C\n");
+                pos = 0;
+                break;
+            }
             else if (key == 8) {
                 if (pos > 0) {
                     pos--;
@@ -62,12 +186,39 @@ void shell_main(void) {
         str_trim(line);
 
         if (str_len(line) > 0) {
-            set_attr(0x07); // Default text
+            // Add to history
+            if (history_count < HISTORY_SIZE) {
+                // Add new entry
+                int i = 0;
+                while (line[i] && i < MAX_INPUT - 1) {
+                    history[history_count][i] = line[i];
+                    i++;
+                }
+                history[history_count][i] = '\0';
+                history_count++;
+            } else {
+                // Shift history up and add at end
+                for (int i = 0; i < HISTORY_SIZE - 1; i++) {
+                    for (int j = 0; j < MAX_INPUT; j++) {
+                        history[i][j] = history[i + 1][j];
+                    }
+                }
+                int i = 0;
+                while (line[i] && i < MAX_INPUT - 1) {
+                    history[HISTORY_SIZE - 1][i] = line[i];
+                    i++;
+                }
+                history[HISTORY_SIZE - 1][i] = '\0';
+            }
+            history_pos = history_count;
+            
+            // set_attr(0x07); // Default text
+            strupr(line);
             int result = cmd_dispatch(line);
             
             /* CRITICAL: Handle bad commands so we don't reboot */
-            if (result < 0) {
-                set_attr(0x0C); // Red error
+            if (result == -255) {
+                // set_attr(0x0C); // Red error
                 c_puts("Bad command or file name\n");
             }
         }
