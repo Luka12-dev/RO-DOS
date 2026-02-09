@@ -1,11 +1,26 @@
-# RO-DOS - Retro-Disk Operating System
+# RO-DOS v1.2 Beta - Retro-Disk Operating System
 
-![RO-DOS Logo](assets/RO-DOS.png)
-![RO-DOS Usage](assets/RO-DOS-Running.png)
+## Current Status & Known Issues (v1.2 Beta)
+
+**Status:** v1.2 Beta includes a new Graphical User Interface (GUI)!
+
+**Known Bugs:**
+- **Mouse Support**: Experimental; works in some contexts, but behavior can be erratic or inconsistent.
+- **ESC Key**: Functionality is inconsistent. It works in some applications but does **NOT** work in the File Browser.
+
+> **Developer Note:** The developer is working hard to fix these bugs. We recommend waiting for the full Release for a stable experience.
+
+## Gallery
+
+![Screenshot 0](assets/0.png)
+![Screenshot 1](assets/1.png)
+![Screenshot 2](assets/2.png)
+![Screenshot 3](assets/3.png)
+![Screenshot 3](assets/4.png)
 
 **RO-DOS** (Retro-Disk Operating System) is a 32-bit protected mode operating system written in x86 assembly and C, designed to provide a nostalgic DOS-like command-line experience with modern protected mode features.
 
-## 🎯 Project Overview
+## Project Overview
 
 RO-DOS is a hobby operating system project that combines:
 - **Custom bootloader** - Loads kernel from disk into memory
@@ -17,7 +32,7 @@ RO-DOS is a hobby operating system project that combines:
 
 ### Key Features
 
-✨ **System Features**
+**System Features**
 - 32-bit protected mode execution
 - Custom interrupt descriptor table (IDT)
 - Hardware interrupt handling (timer, keyboard)
@@ -25,20 +40,20 @@ RO-DOS is a hobby operating system project that combines:
 - Real-time clock (RTC) integration
 - System call interface (INT 0x80)
 
-💾 **File System**
+**File System**
 - FAT12 filesystem support
 - Directory operations (DIR, CD, MD, RD)
 - File operations (COPY, DEL, REN, TYPE)
 - Disk utilities (FORMAT, CHKDSK, FDISK)
 
-🖥️ **User Interface**
+**User Interface**
 - VGA text mode (80x25)
 - Hardware cursor support
 - Color customization
 - Command history
 - 100+ built-in commands
 
-## 📋 System Requirements
+## System Requirements
 
 ### Development Environment
 
@@ -55,7 +70,7 @@ RO-DOS is a hobby operating system project that combines:
 - QEMU (Quick Emulator) - v4.0+
 - genisoimage or mkisofs (for ISO creation)
 
-## 🛠️ Installation Instructions
+## Installation Instructions
 
 ### Linux (Ubuntu/Debian)
 
@@ -227,7 +242,7 @@ qemu-system-i386 --version
 # Windows WSL: sudo apt install qemu-system-x86
 ```
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Building RO-DOS
 
@@ -283,7 +298,7 @@ make info         # Display build information
 make help         # Show all available targets
 ```
 
-## 📚 Project Structure
+## Project Structure
 
 ```
 RO-DOS/
@@ -294,37 +309,64 @@ RO-DOS/
 │   ├── filesys.asm        # FAT12 filesystem
 │   ├── io.asm             # VGA text mode & keyboard
 │   ├── interrupt.asm      # IDT and IRQ handlers
+│   ├── vesa.asm           # VESA BIOS Extensions handler
 │   ├── handlers.c         # Interrupt handlers (C)
 │   ├── shell.c            # Command shell
 │   ├── commands.c         # Built-in commands (100+)
 │   ├── syscall.c          # System call interface
 │   ├── utils.c            # Utility functions
-│   └── utils.h            # Utility headers
+│   ├── utils.h            # Utility headers
+│   ├── pci.c              # PCI bus driver
+│   ├── pci.h              # PCI definitions
+│   ├── scrollback.c       # Terminal scrollback buffer
+│   ├── scrollback.h       # Scrollback header
+│   ├── gui_apps.c         # GUI Applications (Notepad, Paint, etc.)
+│   ├── gui_calc.c         # GUI Calculator logic
+│   ├── firmware_loader.c  # Firmware loading mechanism
+│   ├── rust_driver_stubs.c # Adapter for Rust drivers (legacy/stub)
+│   ├── cmd_netmode.c      # Network mode command
+│   ├── network_interface.c # Network interface layer
+│   ├── tcp_ip_stack.c     # TCP/IP implementation
+│   ├── dhcp_client.c      # DHCP client
+│   ├── wifi_autostart.c   # WiFi initialization
+│   ├── wifi_autostart.h   # WiFi header
+│   └── drivers/           # Hardware Drivers
+│       ├── mouse.c        # PS/2 Mouse Driver
+│       ├── mouse.h        # Mouse header
+│       ├── ata.c          # ATA/IDE Disk Driver
+│       ├── ne2000.c       # NE2000 Network Driver
+│       └── vbe_graphics.c # VBE Graphics Driver
 │
 ├── include/               # Header files
-│   ├── stdint.h          # Fixed-width integer types
-│   ├── stddef.h          # Standard definitions
-│   └── stdbool.h         # Boolean type
+│   ├── stdint.h           # Fixed-width integer types
+│   ├── stddef.h           # Standard definitions
+│   ├── stdbool.h          # Boolean type
+│   ├── firmware.h         # Firmware definitions
+│   ├── network.h          # Network definitions
+│   └── portio.h           # I/O port definitions
 │
 ├── build/                 # Build output (generated)
-│   ├── bootload.bin      # Compiled bootloader
-│   ├── kernel.bin        # Compiled kernel
-│   ├── rodos.img         # Bootable floppy image
-│   ├── rodos.iso         # Bootable ISO image
-│   └── obj/              # Object files
+│   ├── bootload.bin       # Compiled bootloader
+│   ├── kernel.bin         # Compiled kernel
+│   ├── rodos.img          # Bootable disk image
+│   ├── rodos.iso          # Bootable ISO image
+│   └── obj/               # Object files
 │
 ├── assets/                # Images and media
-│   ├── RO-DOS.png        # Logo
-│   └── boot.png          # Boot screen
+│   ├── 0.png              # Screenshot 0 (Notepad)
+│   ├── 1.png              # Screenshot 1 (File Browser)
+│   ├── 2.png              # Screenshot 2 (Clock)
+│   ├── 3.png              # Screenshot 3 (Usage)
+│   └── 4.png              # Screenshot 4 (Usage)
 │
-├── link.ld               # Linker script
-├── Makefile              # Build configuration
-├── run.sh                # Quick build & run script
-├── README.md             # This file
-└── STRUCTURE.md          # Detailed architecture docs
+├── link.ld                # Linker script
+├── Makefile               # Build configuration
+├── run.sh                 # Quick build & run script
+└── README.md              # This file
+
 ```
 
-## 🎮 Using RO-DOS
+## Using RO-DOS
 
 ### Basic Commands
 
@@ -390,7 +432,7 @@ IRQ                 # Show IRQ assignments
 USB                 # List USB devices
 ```
 
-## 🏗️ Architecture Overview
+## Architecture Overview
 
 ### Boot Process
 
@@ -443,7 +485,7 @@ RO-DOS provides a UNIX-like system call interface through `INT 0x80`:
 | SYS_SYSINFO | 0x54 | Get system information |
 | SYS_READ_SECTOR | 0x61 | Read disk sector |
 
-## 🧪 Testing & Debugging
+## Testing & Debugging
 
 ### Debug Build
 
@@ -495,13 +537,12 @@ gdb
 - Verify command dispatcher in commands.c
 - Add debug output to trace execution
 
-## 📖 Documentation
+## Documentation
 
-- [STRUCTURE.md](STRUCTURE.md) - Detailed architecture documentation
 - [Makefile](Makefile) - Build system documentation (inline comments)
 - Source code contains extensive inline comments
 
-## 🤝 Contributing
+## Contributing
 
 This is a personal educational project, but feedback and suggestions are welcome!
 
@@ -513,12 +554,12 @@ This is a personal educational project, but feedback and suggestions are welcome
 4. Test in QEMU before committing
 5. Update documentation for new features
 
-## 📝 License
+## License
 
 This project is released under the MIT License.
 
 ```
-Copyright (c) 2025 Luka
+Copyright (c) 2026 Luka
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -539,21 +580,15 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - OSDev Community for x86 architecture resources
 - NASM Documentation for assembly reference
 - QEMU Project for emulation platform
 - DOS heritage and retro computing community
 
-## 📬 Contact
-
-For questions, suggestions, or bug reports:
-- Open an issue on the project repository
-- Contact: [Your contact information]
-
 ---
 
-**RO-DOS** - *Bringing retro computing into the modern age* 🖥️✨
+**RO-DOS** - *Bringing retro computing into the modern age*
 
-Built with ❤️ using x86 Assembly and C
+Built with love using x86 Assembly and C
