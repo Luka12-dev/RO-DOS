@@ -24,6 +24,13 @@
 #define ATA_SR_DRQ       0x08
 #define ATA_SR_ERR       0x01
 
+/* Shutdown flag */
+static volatile int shutting_down = 0;
+
+void set_shutting_down(void) {
+    shutting_down = 1;
+}
+
 /* External kernel/IO functions */
 extern void c_puts(const char* s);
 extern void set_attr(uint8_t a);
@@ -60,6 +67,15 @@ static inline void insw(uint16_t port, void *addr, uint32_t count) {
     );
 }
 
+static inline void outsw(uint16_t port, const void *addr, uint32_t count) {
+    __asm__ volatile (
+        "cld; rep outsw"
+        : "+S"(addr), "+c"(count)
+        : "d"(port)
+        : "memory"
+    );
+}
+
 /*
  PIC remap
 */
@@ -91,6 +107,12 @@ void timer_handler(registers_t *regs) {
 }
 
 void isr_handler(registers_t *regs) {
+    if (shutting_down) {
+        /* During shutdown, just halt - don't print error */
+        __asm__ volatile("cli");
+        for (;;) { __asm__ volatile("hlt"); }
+    }
+    
     (void)regs;
     c_puts("\nCPU EXCEPTION - SYSTEM HALTED\n");
     __asm__ volatile("cli");
@@ -117,13 +139,76 @@ int disk_read_lba(uint32_t lba, uint32_t count, void* buffer) {
     for (int k = 0; k < 4; ++k) { (void)inb(ATA_STATUS); }
 
     for (uint32_t i = 0; i < count; ++i) {
-        while (1) {
+        /* Wait with timeout */
+        int timeout = 100000;
+        while (timeout-- > 0) {
             status = inb(ATA_STATUS);
             if (status & ATA_SR_ERR) return -1;
             if (!(status & ATA_SR_BSY) && (status & ATA_SR_DRQ)) break;
         }
+        if (timeout <= 0) return -1;  /* Timeout */
+        
         insw(ATA_DATA, buf_ptr, 256);
         buf_ptr += 256;
     }
+    return 0;
+}
+/* Disk write function for persistence - FIXED VERSION */
+int disk_write_lba(uint32_t lba, uint32_t count, void* buffer) {
+    uint8_t status;
+    uint16_t *buf_ptr = (uint16_t*)buffer;
+
+    /* Select drive and set LBA mode */
+    outb(ATA_DRIVE_HEAD, (uint8_t)(0xE0 | ((lba >> 24) & 0x0F)));
+    
+    /* Wait for drive to be ready */
+    int timeout = 1000000;
+    while (timeout-- > 0) {
+        status = inb(ATA_STATUS);
+        if (!(status & ATA_SR_BSY)) break;
+    }
+    if (timeout <= 0) return -1;
+    
+    /* Send write command */
+    outb(ATA_SECTOR_COUNT, (uint8_t)count);
+    outb(ATA_LBA_LOW, (uint8_t)(lba & 0xFF));
+    outb(ATA_LBA_MID, (uint8_t)((lba >> 8) & 0xFF));
+    outb(ATA_LBA_HIGH, (uint8_t)((lba >> 16) & 0xFF));
+    outb(ATA_COMMAND, 0x30);  /* WRITE SECTORS command */
+
+    /* Small delay */
+    for (int k = 0; k < 4; ++k) { (void)inb(ATA_STATUS); }
+
+    for (uint32_t i = 0; i < count; ++i) {
+        /* Wait for drive to be ready to receive data */
+        timeout = 1000000;
+        while (timeout-- > 0) {
+            status = inb(ATA_STATUS);
+            if (status & ATA_SR_ERR) return -1;
+            if (!(status & ATA_SR_BSY) && (status & ATA_SR_DRQ)) break;
+        }
+        if (timeout <= 0) return -1;
+        
+        /* Write 256 words (512 bytes) using outsw */
+        outsw(ATA_DATA, buf_ptr, 256);
+        buf_ptr += 256;
+        
+        /* Wait for write to complete */
+        timeout = 1000000;
+        while (timeout-- > 0) {
+            status = inb(ATA_STATUS);
+            if (!(status & ATA_SR_BSY)) break;
+        }
+        if (timeout <= 0) return -1;
+    }
+    
+    /* Flush cache */
+    outb(ATA_COMMAND, 0xE7);  /* FLUSH CACHE command */
+    timeout = 1000000;
+    while (timeout-- > 0) {
+        status = inb(ATA_STATUS);
+        if (!(status & ATA_SR_BSY)) break;
+    }
+    
     return 0;
 }
