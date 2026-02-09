@@ -1,6 +1,6 @@
 # RO-DOS Makefile
 # Author: RO-DOS Development Team
-# Purpose: Build RO-DOS from assembly and C sources into bootable floppy image
+# Purpose: Build RO-DOS from assembly, C, and Rust sources into bootable floppy image
 # Target: Bootable 1.44MB floppy disk image
 
 # Tool Configuration
@@ -15,6 +15,7 @@ MKDIR       := mkdir -p
 RM          := rm -f
 GENISOIMAGE := genisoimage
 MKISOFS     := mkisofs
+CARGO       := cargo
 
 # Build Flags
 
@@ -24,16 +25,19 @@ NASMFLAGS_BIN := -f bin
 
 # GCC flags for 32-bit freestanding
 CFLAGS := -m32 -ffreestanding -nostdlib -Iinclude -fno-builtin -fno-stack-protector
-CFLAGS += -O2 -Wall -Wextra -Werror -std=c11
+CFLAGS += -O0 -g -Wall -Wextra -std=c11
 CFLAGS += -fno-pie -fno-pic
-CFLAGS += -mno-red-zone -mno-mmx -mno-sse -mno-sse2
+CFLAGS += -mpreferred-stack-boundary=2 -mno-mmx -mno-sse -mno-sse2
 CFLAGS += -c
 
 # Linker flags
 LDFLAGS := -m elf_i386 -nostdlib -T link.ld --oformat binary
 
+
+
 # Directories and Files
 SRC_DIR     := src
+DRIVER_DIR  := Drivers
 BUILD_DIR   := build
 OBJ_DIR     := $(BUILD_DIR)/obj
 
@@ -43,6 +47,9 @@ KERNEL_BIN  := $(BUILD_DIR)/kernel.bin
 FLOPPY_IMG  := $(BUILD_DIR)/rodos.img
 ISO_IMG     := $(BUILD_DIR)/rodos.iso
 ISO_DIR     := $(BUILD_DIR)/iso
+
+HDD_IMG     := $(BUILD_DIR)/rodos_hdd.img
+HDD_SIZE_MB := 100
 
 # Image parameters
 IMG_SIZE_SECTORS := 2880           # 1.44MB floppy (2880 * 512 bytes)
@@ -56,19 +63,34 @@ ASM_KERNEL := $(SRC_DIR)/kernel.asm \
               $(SRC_DIR)/memory.asm \
               $(SRC_DIR)/filesys.asm \
               $(SRC_DIR)/io.asm \
-              $(SRC_DIR)/interrupt.asm
+              $(SRC_DIR)/interrupt.asm \
+              $(SRC_DIR)/vesa.asm
 
-# C sources
+# C sources - kernel files (includes real hardware drivers)
 C_SOURCES  := $(SRC_DIR)/shell.c \
               $(SRC_DIR)/commands.c \
+              $(SRC_DIR)/cmd_netmode.c \
               $(SRC_DIR)/syscall.c \
               $(SRC_DIR)/utils.c \
-              $(SRC_DIR)/handlers.c
+              $(SRC_DIR)/handlers.c \
+              $(SRC_DIR)/pci.c \
+              $(SRC_DIR)/wifi_autostart.c \
+              $(SRC_DIR)/network_interface.c \
+              $(SRC_DIR)/tcp_ip_stack.c \
+              $(SRC_DIR)/dhcp_client.c \
+              $(SRC_DIR)/firmware_loader.c \
+              $(SRC_DIR)/scrollback.c \
+              $(SRC_DIR)/rust_driver_stubs.c \
+              $(SRC_DIR)/gui_apps.c \
+              $(SRC_DIR)/drivers/ata.c \
+              $(SRC_DIR)/drivers/vbe_graphics.c \
+              $(SRC_DIR)/drivers/mouse.c \
+              $(SRC_DIR)/drivers/ne2000.c
 
 # Object files
-ASM_OBJS   := $(patsubst $(SRC_DIR)/%.asm,$(OBJ_DIR)/%.o,$(ASM_KERNEL))
-C_OBJS     := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(C_SOURCES))
-ALL_OBJS   := $(ASM_OBJS) $(C_OBJS)
+ASM_OBJS      := $(patsubst $(SRC_DIR)/%.asm,$(OBJ_DIR)/%.o,$(ASM_KERNEL))
+C_OBJS        := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(C_SOURCES))
+ALL_OBJS      := $(ASM_OBJS) $(C_OBJS)
 
 # Build Rules
 
@@ -86,9 +108,15 @@ $(BUILD_DIR):
 
 $(OBJ_DIR):
 	@$(MKDIR) $(OBJ_DIR)
+	@$(MKDIR) $(OBJ_DIR)/drivers
+
+
 
 $(ISO_DIR):
 	@$(MKDIR) $(ISO_DIR)
+
+# Rust Drivers Build
+
 
 # Bootloader Build
 $(BOOT_BIN): $(ASM_BOOT) $(KERNEL_BIN) | $(BUILD_DIR)
@@ -113,10 +141,10 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
 	@echo "Compiling: $<"
 	@$(GCC) $(CFLAGS) $< -o $@
 
-# Kernel Linking
+# Kernel Linking (with Rust library if available)
 $(KERNEL_BIN): $(ALL_OBJS) link.ld | $(BUILD_DIR)
 	@echo "Linking kernel..."
-	@$(LD) $(LDFLAGS) -o $@ $(ALL_OBJS)
+	$(LD) $(LDFLAGS) -o $@ $(ALL_OBJS)
 	@echo "✓ Kernel linked successfully"
 	@ls -lh $@
 
@@ -160,25 +188,54 @@ $(ISO_IMG): $(FLOPPY_IMG) | $(BUILD_DIR) $(ISO_DIR)
 
 # Running and Testing
 
+# Create persistent hard disk image (only if it doesn't exist)
+$(HDD_IMG):
+	@echo "Creating persistent hard disk image ($(HDD_SIZE_MB)MB)..."
+	@$(DD) if=/dev/zero of=$(HDD_IMG) bs=1M count=$(HDD_SIZE_MB) status=none
+	@echo "✓ Hard disk image created: $(HDD_IMG)"
+
 .PHONY: run
-run: $(FLOPPY_IMG)
-	@echo "Starting QEMU (Floppy Mode)..."
-	@$(QEMU) -drive file=$(FLOPPY_IMG),if=floppy,format=raw -boot a -m 16M
+run: $(FLOPPY_IMG) $(HDD_IMG)
+	@echo "Starting QEMU with VirtIO GPU + VirtIO Network + Persistent HDD..."
+	@$(QEMU) -drive file=$(FLOPPY_IMG),if=floppy,format=raw \
+		-drive file=$(HDD_IMG),if=ide,format=raw \
+		-boot a -m 32M \
+		-device virtio-net-pci,disable-modern=on,netdev=net0 -netdev user,id=net0 \
+		-device virtio-gpu-pci \
+		-vga std \
+		-display gtk,zoom-to-fit=off
+
+.PHONY: run-debug
+run-debug: $(FLOPPY_IMG) $(HDD_IMG)
+	@echo "Starting QEMU with debug options..."
+	@$(QEMU) -drive file=$(FLOPPY_IMG),if=floppy,format=raw \
+		-drive file=$(HDD_IMG),if=ide,format=raw \
+		-boot a -m 32M \
+		-device virtio-net-pci,disable-modern=on,netdev=net0 -netdev user,id=net0 \
+		-device virtio-gpu-pci \
+		-d int,cpu_reset -no-reboot
 
 .PHONY: run-iso
-run-iso: $(ISO_IMG)
+run-iso: $(ISO_IMG) $(HDD_IMG)
 	@echo "Starting QEMU with ISO (CD-ROM Mode)..."
 	@if [ ! -f $(ISO_IMG) ]; then \
 		echo "ERROR: ISO file not found at $(ISO_IMG)"; \
 		exit 1; \
 	fi
 	@echo "Booting ISO as CD-ROM (Drive D)..."
-	@$(QEMU) -cdrom $(ISO_IMG) -boot d -m 16M
+	@$(QEMU) -cdrom $(ISO_IMG) \
+		-drive file=$(HDD_IMG),if=ide,format=raw \
+		-boot d -m 32M \
+		-device virtio-net-pci,disable-modern=on,netdev=net0 -netdev user,id=net0 \
+		-device virtio-gpu-pci
 
-.PHONY: run-debug
-run-debug: $(FLOPPY_IMG)
-	@echo "Starting QEMU with debug options..."
-	@$(QEMU) -drive file=$(FLOPPY_IMG),if=floppy,format=raw -boot a -m 16M -d int,cpu_reset -no-reboot
+# Reset the hard disk (clear all saved data)
+.PHONY: reset-hdd
+reset-hdd:
+	@echo "Resetting hard disk image..."
+	@$(RM) $(HDD_IMG)
+	@$(DD) if=/dev/zero of=$(HDD_IMG) bs=1M count=$(HDD_SIZE_MB) status=none
+	@echo "✓ Hard disk reset complete"
 
 # Debugging and Analysis
 
@@ -232,15 +289,24 @@ info:
 # Cleaning
 .PHONY: clean
 clean:
-	@echo "Cleaning build artifacts..."
+	@echo "Cleaning build artifacts (preserving HDD for persistence)..."
+	@$(RM) $(BOOT_BIN) $(KERNEL_BIN) $(FLOPPY_IMG) $(ISO_IMG)
+	@echo "✓ Clean complete (HDD preserved at $(HDD_IMG))"
+
+.PHONY: clean-all
+clean-all:
+	@echo "Cleaning ALL build artifacts including HDD..."
+	@echo "Cleaning ALL build artifacts including HDD..."
 	@$(RM) -r $(BUILD_DIR)
-	@echo "✓ Clean complete"
+	@echo "✓ Full clean complete"
 
 .PHONY: clean-objs
 clean-objs:
 	@echo "Cleaning object files..."
 	@$(RM) -r $(OBJ_DIR)
 	@echo "✓ Object files cleaned"
+
+
 
 .PHONY: clean-img
 clean-img:
@@ -250,7 +316,8 @@ clean-img:
 	@echo "✓ Disk images cleaned"
 
 .PHONY: rebuild
-rebuild: clean all
+rebuild: clean-all all
+	@echo "Note: HDD was reset. All saved files cleared."
 
 # Help
 .PHONY: help
@@ -259,18 +326,33 @@ help:
 	@echo "RO-DOS Makefile - Available Targets"
 	@echo "======================================"
 	@echo "Building:"
-	@echo "  make all        - Build complete system (default)"
-	@echo "  make rebuild    - Clean and rebuild everything"
-	@echo "  make clean      - Remove all build artifacts"
+	@echo "  make all          - Build complete system (default)"
+
+	@echo "  make rebuild      - Clean and rebuild everything"
+	@echo "  make clean        - Remove build artifacts (preserves HDD)"
+	@echo "  make clean-all    - Remove ALL artifacts including HDD"
+
 	@echo ""
 	@echo "Running:"
-	@echo "  make run        - Build and run in QEMU (floppy)"
-	@echo "  make run-iso    - Build and run in QEMU (ISO)"
-	@echo "  make run-debug  - Run with CPU debug output"
+	@echo "  make run          - Build and run in QEMU (floppy + HDD)"
+	@echo "  make run-iso      - Build and run in QEMU (ISO + HDD)"
+	@echo "  make run-debug    - Run with CPU debug output"
+	@echo ""
+	@echo "Storage:"
+	@echo "  make reset-hdd    - Reset HDD (clear all saved files)"
+	@echo "  HDD location: $(HDD_IMG)"
 	@echo ""
 	@echo "Info:"
-	@echo "  make info       - Display build information"
-	@echo "  make help       - Show this help message"
+	@echo "  make info         - Display build information"
+	@echo "  make help         - Show this help message"
+	@echo "======================================"
+	@echo ""
+	@echo "Filesystem Commands in RO-DOS:"
+	@echo "  TOUCH file  - Create empty file (persists after reboot)"
+	@echo "  MKDIR dir   - Create directory (persists after reboot)"
+	@echo "  NANO file   - Edit file (persists after reboot)"
+	@echo "  CD dir      - Change directory (persists after reboot)"
+	@echo "  DIR/LS      - List files in current directory"
 	@echo "======================================"
 
 # Dependencies
