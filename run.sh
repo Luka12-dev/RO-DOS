@@ -1,12 +1,29 @@
-make clean # comment this line if you don't want to clean the build
-make all   # Build all files (.asm and .c into .o then .bin then .img or .iso)
-make run   # this will run as .img
+#!/bin/bash
 
-# make run-iso # uncomment this line if you want to run as .iso not .img
+# RO-DOS Build & Run Script
 
-# make clean - clean the previus builds
-# make all - build all the .asm and .c files
-# make run - run a QEMU
-# WARNING: For building RO-DOS i recommend to use Linux, specify Ubuntu.
-# If you are on Windows use WSL for best compatibility, use something like Ubuntu 24.04 (i recommend)
-echo RO-DOS is shutdown.
+# Clean previous build artifacts (Optional)
+# make clean 
+
+# Build the system
+echo "Building RO-DOS..."
+make all
+
+# Run in QEMU (defaulting to HDD image)
+echo "Starting RO-DOS in QEMU..."
+make run
+
+# Alternative: Run as ISO
+# make run-iso 
+
+# Information
+# make clean    - Clean build artifacts
+# make all      - Compile assembly and C source files
+# make run      - Launch QEMU with disk image
+
+echo "---------------------------------------------------"
+echo "WARNING: For building RO-DOS, Linux (Ubuntu) is recommended."
+echo "Windows users should use WSL (Ubuntu 24.04 recommended)."
+echo "---------------------------------------------------"
+
+echo "RO-DOS has shut down."
